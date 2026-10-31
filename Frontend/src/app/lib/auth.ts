@@ -1,3 +1,17 @@
+/**
+ * Session storage for the JWT.
+ *
+ * The token lives in `localStorage`, which is readable by any script on this
+ * origin — an httpOnly cookie would not be. That trade is deliberate: the API is
+ * a separate origin, so cookies would need CORS credentials plus CSRF defences,
+ * and this is a single-page app with no server to set them. The mitigation is
+ * that any XSS is already fatal here, so the chosen defence is keeping scripts
+ * out: no `eval`, no injected HTML in our own components, and a dependency set
+ * that is pinned and lock-filed.
+ *
+ * If this moved behind a backend-for-frontend, httpOnly cookies would be the
+ * right answer and this module is the only place that would change.
+ */
 export type AuthSession = {
   id: string;
   email: string;
@@ -28,13 +42,15 @@ export function authEventName() {
  * check only). Returns null for anything that is not a well-formed JWT.
  */
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  const parts = token.split(".");
-  if (parts.length !== 3) {
+  // Destructured rather than indexed so the payload segment is a checked value
+  // instead of an assertion about the split's length.
+  const [, payloadSegment, signatureSegment] = token.split(".");
+  if (!payloadSegment || !signatureSegment) {
     return null;
   }
 
   try {
-    let base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    let base64 = payloadSegment.replace(/-/g, "+").replace(/_/g, "/");
     // Restore base64 padding stripped by base64url encoding.
     while (base64.length % 4 !== 0) {
       base64 += "=";

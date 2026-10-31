@@ -11,7 +11,12 @@ export type { PaymentOption };
  * RPC endpoint: any of those invented in the browser is exactly how funds end up on
  * the wrong network, so checkout refuses to quote against a fallback route.
  */
-export const FALLBACK_PAYMENT_OPTIONS: PaymentOption[] = [
+/**
+ * Typed as a non-empty tuple so `FALLBACK_PAYMENT_OPTIONS[0]` is known to exist.
+ * Callers fall back to it as a last resort, and a plain array would make that
+ * index `PaymentOption | undefined` and push a needless assertion into the UI.
+ */
+export const FALLBACK_PAYMENT_OPTIONS: [PaymentOption, ...PaymentOption[]] = [
   {
     method: "btc",
     token: "BTC",

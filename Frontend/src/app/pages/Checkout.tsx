@@ -1,4 +1,3 @@
-import { motion } from "motion/react";
 import { Link, useNavigate, useSearchParams } from "react-router";
 import { CheckCircle2, ArrowRight, FileDigit, UserRound, Upload } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";

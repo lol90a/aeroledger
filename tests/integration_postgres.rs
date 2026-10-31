@@ -3,7 +3,8 @@
 //! They are `#[ignore]`d by default because they need a disposable database. Run:
 //!
 //! ```text
-//! docker run --rm -d --name aeroledger-test -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:16
+//! docker run --rm -d --name aeroledger-test \
+//!   -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:16
 //! TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres \
 //!   cargo test --test integration_postgres -- --ignored --test-threads=1
 //! ```

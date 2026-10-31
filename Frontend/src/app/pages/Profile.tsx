@@ -1,5 +1,5 @@
 import { motion } from "motion/react";
-import { User, Shield, Wallet, Bell, Lock, Smartphone, Fingerprint, Activity } from "lucide-react";
+import { User, Shield, Wallet, Bell, Fingerprint, Activity } from "lucide-react";
 
 export default function Profile() {
   return (

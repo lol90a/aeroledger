@@ -5,23 +5,21 @@
 //! AeroLedger is a **marketplace intermediary**, not the merchant of record. Every
 //! order is a three-party relationship:
 //!
-//! | Party        | On-chain identity                 | Role                                                |
-//! |--------------|-----------------------------------|-----------------------------------------------------|
-//! | Buyer        | `Order.buyer` (signs `create_order`) | Funds the escrow vault, receives refunds           |
-//! | Seller       | `Merchant.authority`              | Accepts the order, receives the net payout          |
-//! | Payout wallet| `Merchant.payout_wallet`          | Where the seller's proceeds land (ATA of this key)  |
-//! | Platform     | `Config.treasury`                 | Receives the quoted platform fee                    |
-//! | Admin        | `Config.admin`                    | Governance only -- see "Privileged actions" below   |
-//! | Quote signer | `Config.quote_authority`          | Ed25519 key that authorises the price of each order |
+//! | Party        | Identity                 | Role                               |
+//! |--------------|--------------------------|------------------------------------|
+//! | Buyer        | `Order.buyer`            | Funds the vault, receives refunds  |
+//! | Seller       | `Merchant.authority`     | Accepts the order, takes the payout|
+//! | Payout wallet| `Merchant.payout_wallet` | Where proceeds land (ATA of it)    |
+//! | Platform     | `Config.treasury`        | Receives the quoted fee            |
+//! | Admin        | `Config.admin`           | Governance only, see below         |
+//! | Quote signer | `Config.quote_authority` | Ed25519 key authorising the price  |
 //!
-//! The previous version of this program had no seller at all: `complete_order`
-//! moved the buyer's tokens to an `admin_token_account`, so the escrow encoded a
-//! buyer/admin relationship and the platform was implicitly the merchant for every
-//! sale. That is the issue raised in review and it is fixed here: a seller must be
-//! registered by governance before any order can name them, and the destination of
-//! a payout is **snapshotted into the order at creation time** from the merchant
-//! record. Nobody -- not the buyer, not the seller, not the admin -- can pass a
-//! different token account at completion time and redirect the money.
+//! The previous version had no seller: `complete_order` moved the buyer's tokens
+//! to an `admin_token_account`, so the platform was implicitly the merchant for
+//! every sale. Fixed here. A seller must be registered by governance before an
+//! order can name them, and the payout destination is **snapshotted into the
+//! order at creation** from the merchant record, so nobody -- buyer, seller or
+//! admin -- can pass a different token account at completion and redirect it.
 //!
 //! ## Privileged actions (explicit trust model)
 //!
@@ -48,14 +46,11 @@
 //!
 //! ## Token support
 //!
-//! SPL Token only. `Program<'info, Token>` plus `anchor_spl::token::{Mint,
-//! TokenAccount}` pin every token account to the legacy SPL Token program, so
-//! Token-2022 mints are rejected at deserialization. This is deliberate and
-//! fail-closed: Token-2022 transfer fees, transfer hooks and confidential-transfer
-//! extensions would each break the escrow's "what went in is what comes out"
-//! accounting, and supporting them safely requires per-extension analysis that has
-//! not been done. Mints are additionally gated by an admin-managed allow-list
-//! (`SupportedMint`), so only reviewed mints can ever be escrowed.
+//! SPL Token only, enforced at deserialization by `Program<'info, Token>`, so
+//! Token-2022 mints are rejected. Deliberate and fail-closed: its transfer fees,
+//! hooks and confidential transfers would each break the escrow's "what went in
+//! is what comes out" accounting. Mints are further gated by an admin-managed
+//! allow-list (`SupportedMint`).
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::keccak;

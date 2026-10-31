@@ -1,6 +1,6 @@
 import { motion } from "motion/react";
 import { Link } from "react-router";
-import { Plane, ArrowRight, ShieldCheck, Zap, Globe, Bitcoin } from "lucide-react";
+import { Plane, ArrowRight, ShieldCheck, Globe, Bitcoin } from "lucide-react";
 
 export default function LandingPage() {
   return (

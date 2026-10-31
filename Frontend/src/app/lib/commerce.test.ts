@@ -42,14 +42,14 @@ describe("addBackendAssetToCart", () => {
     const items = addBackendAssetToCart(asset());
 
     expect(items).toHaveLength(1);
-    expect(items[0].backendAssetId).toBe("00000000-0000-0000-0000-00000000a003");
-    expect(items[0].kind).toBe("asset");
+    expect(items[0]?.backendAssetId).toBe("00000000-0000-0000-0000-00000000a003");
+    expect(items[0]?.kind).toBe("asset");
   });
 
   it("keys the cart item on the backend id so it is stable across sessions", () => {
     const items = addBackendAssetToCart(asset());
-    expect(items[0].id).toBe("asset-00000000-0000-0000-0000-00000000a003");
-    expect(items[0].sourceId).toBe("00000000-0000-0000-0000-00000000a003");
+    expect(items[0]?.id).toBe("asset-00000000-0000-0000-0000-00000000a003");
+    expect(items[0]?.sourceId).toBe("00000000-0000-0000-0000-00000000a003");
   });
 
   it("does not add the same asset twice", () => {
@@ -69,14 +69,14 @@ describe("addBackendAssetToCart", () => {
 
   it("persists to localStorage so a reload keeps the cart", () => {
     addBackendAssetToCart(asset());
-    expect(getCartItems()[0].backendAssetId).toBe(
+    expect(getCartItems()[0]?.backendAssetId).toBe(
       "00000000-0000-0000-0000-00000000a003"
     );
   });
 
   it("formats the displayed price from the server's token price", () => {
     const items = addBackendAssetToCart(asset({ token_price: 15_500 }));
-    expect(items[0].fiatPrice).toBe("$15,500");
+    expect(items[0]?.fiatPrice).toBe("$15,500");
   });
 });
 
@@ -94,8 +94,8 @@ describe("addFlightToCart", () => {
 
   it("keeps the backend flight id on the cart item", () => {
     const items = addFlightToCart(flight);
-    expect(items[0].backendFlightId).toBe("00000000-0000-0000-0000-000000000003");
-    expect(items[0].kind).toBe("flight");
+    expect(items[0]?.backendFlightId).toBe("00000000-0000-0000-0000-000000000003");
+    expect(items[0]?.kind).toBe("flight");
   });
 
   it("does not add the same flight twice", () => {
@@ -120,7 +120,7 @@ describe("removeCartItem", () => {
 
     const items = removeCartItem("asset-00000000-0000-0000-0000-00000000a003");
     expect(items).toHaveLength(1);
-    expect(items[0].backendAssetId).toBe("00000000-0000-0000-0000-00000000a001");
+    expect(items[0]?.backendAssetId).toBe("00000000-0000-0000-0000-00000000a001");
   });
 
   it("is a no-op for an id that is not in the cart", () => {

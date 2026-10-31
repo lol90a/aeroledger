@@ -19,54 +19,39 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
  *
  * @dev ## Parties and trust model
  *
- *      | Party    | Identity                       | Powers                                          |
- *      |----------|--------------------------------|-------------------------------------------------|
- *      | Buyer    | `Order.buyer`                  | Funds escrow; cancels while Pending; timeout exit|
- *      | Seller   | `Merchant.authority`           | Confirms, completes, refunds their own orders    |
- *      | Payout   | `Order.payoutWallet` (snapshot)| Sole destination of seller proceeds              |
- *      | Treasury | `Order.treasury` (snapshot)    | Sole destination of the platform fee             |
- *      | Owner    | `Ownable2Step`                 | Governance: merchants, tokens, signer, pause     |
- *      | Quote    | `quoteSigner`                  | EIP-712 key that authorises each order's price   |
+ *      | Party    | Identity              | Powers                            |
+ *      |----------|-----------------------|-----------------------------------|
+ *      | Buyer    | `Order.buyer`         | Funds escrow, cancels, times out  |
+ *      | Seller   | `Merchant.authority`  | Confirms, completes, refunds own  |
+ *      | Payout   | `Order.payoutWallet`  | Sole destination of proceeds      |
+ *      | Treasury | `Order.treasury`      | Sole destination of the fee       |
+ *      | Owner    | `Ownable2Step`        | Merchants, tokens, signer, pause  |
+ *      | Quote    | `quoteSigner`         | EIP-712 key authorising the price |
  *
  *      The earlier version released funds to `owner()` and let the buyer choose
- *      `msg.value` freely, so (a) the escrow modelled a buyer/platform relationship
- *      with no seller, and (b) a buyer could pay one wei for a $5,000 booking by
- *      calling the contract directly. Both are fixed here:
+ *      `msg.value`, so the escrow had no seller and a buyer could pay one wei for
+ *      a $5,000 booking. Both are fixed: every order names a governance-registered
+ *      seller whose payout address is snapshotted at creation, and carries an
+ *      EIP-712 `Quote` over (orderHash, buyer, seller, token, amount, fee, expiry)
+ *      whose amount is enforced exactly.
  *
- *      - Every order names a seller that governance registered in advance, and the
- *        payout address is **snapshotted into the order at creation**. No caller can
- *        pass a different destination at settlement time, and rotating a merchant's
- *        payout wallet does not retarget money already in escrow.
- *      - Every order carries an EIP-712 `Quote` signed by `quoteSigner`, binding
- *        (orderHash, buyer, seller, token, amount, fee, expiry). The contract
- *        enforces the signed amount exactly, so price is set by the backend and
- *        cannot be edited in the browser or in the calldata.
- *
- *      What the owner CANNOT do: choose a payout or refund destination, change the
- *      amount of a live order, confirm on a seller's behalf, or trap a buyer's funds
- *      (see {timeoutRefund}).
- *
- *      What the owner CAN do, stated plainly because it is the largest residual
- *      power here: decide the outcome of any **Confirmed** order. {completeOrder}
- *      releases it to the seller and {refundOrder} returns it to the buyer, and the
- *      owner may call either. The owner is therefore the dispute arbiter. The
- *      destinations are still fixed by the order's own snapshot, so this is a choice
+ *      The owner CANNOT choose a payout or refund destination, change a live
+ *      order's amount, confirm for a seller, or trap a buyer's funds (see
+ *      {timeoutRefund}). The owner CAN decide the outcome of any Confirmed order,
+ *      via {completeOrder} or {refundOrder} — it is the dispute arbiter. Both
+ *      destinations stay fixed by the order's snapshot, so that is a choice
  *      between two predetermined parties, never a redirection to a third.
  *
- *      ## Asset-handling properties
- *      - Native and ERC20 escrow are strictly segregated ({createOrder} is
- *        native-only, {createOrderERC20} is ERC20-only) and per-asset escrow
- *        balances are tracked, so a payout can never exceed what was deposited for
- *        that asset.
- *      - All ERC20 movements use SafeERC20, so non-standard tokens (USDT returns no
- *        bool) work and silent-false transfers revert.
- *      - The contract measures the **actual** received balance delta and requires it
- *        to be at least the quoted amount. A token that taxes the INBOUND transfer
- *        therefore reverts rather than under-funding an order. An outbound-only tax
- *        is out of scope and is excluded by the token allow-list, not by code — see
- *        {createOrderERC20}.
- *      - Native transfers use a checked low-level call, so a multisig payout address
- *        cannot be bricked by the 2300-gas stipend.
+ *      ## Asset handling
+ *      - Native and ERC20 paths are segregated and balances tracked per asset, so
+ *        a payout can never exceed what was deposited for that asset.
+ *      - SafeERC20 throughout, so no-bool tokens (USDT) work and silent-false
+ *        transfers revert.
+ *      - Deposits credit the measured balance delta and revert if it is short, so
+ *        an inbound-taxing token cannot under-fund a signed quote. Outbound-only
+ *        taxes are excluded by the allow-list, not by code — see {createOrderERC20}.
+ *      - Native payouts use a checked call, so a multisig recipient is not bricked
+ *        by the 2300-gas stipend.
  *      - Checks-Effects-Interactions plus nonReentrant on every value-moving path.
  */
 contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
