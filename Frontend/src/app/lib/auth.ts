@@ -42,10 +42,13 @@ export function authEventName() {
  * check only). Returns null for anything that is not a well-formed JWT.
  */
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  // Destructured rather than indexed so the payload segment is a checked value
-  // instead of an assertion about the split's length.
-  const [, payloadSegment, signatureSegment] = token.split(".");
-  if (!payloadSegment || !signatureSegment) {
+  // A JWT is exactly three non-empty dot-separated segments. The length check is
+  // the structural rule; the destructuring is what makes the segment a checked
+  // value rather than an index the compiler has to take on trust. Both are
+  // needed -- dropping the length check would let a four-segment token through.
+  const parts = token.split(".");
+  const [headerSegment, payloadSegment, signatureSegment] = parts;
+  if (parts.length !== 3 || !headerSegment || !payloadSegment || !signatureSegment) {
     return null;
   }
 
