@@ -593,6 +593,33 @@ describe("aeroledger-escrow", () => {
       expect(BigInt(order.amount.toString())).to.equal(amount);
     });
 
+    /**
+     * An order's life runs in three phases and exactly one party set may act in
+     * each, so no outcome is decided by transaction ordering:
+     *
+     *   t <= settlementDeadline   seller settles or refunds; admin may too
+     *   t <= timeoutDeadline      admin only, arbitrating a late settlement
+     *   t >  timeoutDeadline      buyer only, exiting unilaterally
+     *
+     * An earlier version had one deadline that both opened `timeout_refund` and
+     * left `complete_order` unbounded, so past it the two were live together and
+     * whichever transaction landed first took the funds.
+     */
+    it("records a settlement deadline and a later timeout deadline", async () => {
+      const id = `${orderId}-deadlines`;
+      await createOrder({ orderId: id, amount, fee });
+      const order: any = await program.account.order.fetch(orderPda(id));
+
+      const createdAt = Number(order.createdAt);
+      const settlement = Number(order.settlementDeadline);
+      const timeout = Number(order.timeoutDeadline);
+
+      expect(settlement - createdAt).to.equal(REFUND_WINDOW);
+      // disputeWindow defaults to the settlement window at initialize.
+      expect(timeout - settlement).to.equal(REFUND_WINDOW);
+      expect(timeout).to.be.greaterThan(settlement);
+    });
+
     it("rejects a duplicate order id", async () => {
       // The Order PDA for this id already exists, so `init` fails inside the
       // System Program with AccountAlreadyInUse, which is error 0. Through

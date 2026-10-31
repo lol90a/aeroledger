@@ -13,7 +13,12 @@ const { ethers } = require("hardhat");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
 const NATIVE = ethers.ZeroAddress;
-const REFUND_WINDOW = 24 * 60 * 60; // 24h
+const REFUND_WINDOW = 24 * 60 * 60; // 24h — the seller's settlement window
+// disputeWindow defaults to the settlement window, so the buyer's unilateral
+// exit opens two windows after creation.
+const TIMEOUT_DEADLINE = REFUND_WINDOW * 2;
+// Mirrors the contract's MIN_REFUND_WINDOW bound.
+const MIN_WINDOW = 60 * 60;
 const USDC_UNIT = 10n ** 6n;
 
 describe("AeroLedgerEscrow", () => {
@@ -707,10 +712,20 @@ describe("AeroLedgerEscrow", () => {
       );
     });
 
-    it("rejects a normal refund after the window closes", async () => {
+    it("rejects a buyer refund once the settlement window closes", async () => {
       const h = await pendingOrder("r-6");
       await time.increase(REFUND_WINDOW + 1);
+      // Inside the dispute window only the owner may act.
       await expect(escrow.connect(buyer).refundOrder(h)).to.be.revertedWithCustomError(
+        escrow,
+        "SettlementWindowExpired"
+      );
+    });
+
+    it("rejects any refund once the buyer's exit has opened", async () => {
+      const h = await pendingOrder("r-6b");
+      await time.increase(TIMEOUT_DEADLINE + 1);
+      await expect(escrow.connect(owner).refundOrder(h)).to.be.revertedWithCustomError(
         escrow,
         "RefundWindowExpired"
       );
@@ -740,10 +755,20 @@ describe("AeroLedgerEscrow", () => {
     it("lets the buyer self-exit a confirmed-but-never-completed order", async () => {
       const h = await pendingOrder("r-9");
       await escrow.connect(seller).confirmOrder(h);
-      await time.increase(REFUND_WINDOW + 1);
+      await time.increase(TIMEOUT_DEADLINE + 1);
       await expect(escrow.connect(buyer).timeoutRefund(h)).to.changeEtherBalances(
         [buyer, escrow],
         [amount, -amount]
+      );
+    });
+
+    it("keeps the buyer's exit shut during the dispute window", async () => {
+      const h = await pendingOrder("r-9b");
+      await escrow.connect(seller).confirmOrder(h);
+      await time.increase(REFUND_WINDOW + 1);
+      await expect(escrow.connect(buyer).timeoutRefund(h)).to.be.revertedWithCustomError(
+        escrow,
+        "TimeoutNotReached"
       );
     });
 
@@ -755,6 +780,127 @@ describe("AeroLedgerEscrow", () => {
       await expect(escrow.connect(buyer).timeoutRefund(h)).to.be.revertedWithCustomError(
         escrow,
         "InvalidStatus"
+      );
+    });
+  });
+
+  // -------------------------------------------------------------------
+
+  /**
+   * An order's life runs in three phases and exactly one party set may act in
+   * each. The point of these tests is the boundary: there must be no instant at
+   * which settlement and the buyer's unilateral exit are both possible, because
+   * that leaves the outcome to transaction ordering rather than to a rule.
+   *
+   *   t <= settlementDeadline   seller settles or refunds; owner may too
+   *   t <= timeoutDeadline      owner only, arbitrating a late settlement
+   *   t >  timeoutDeadline      buyer only, exiting unilaterally
+   */
+  describe("settlement and timeout never overlap", () => {
+    const amount = ethers.parseEther("2");
+
+    async function confirmedOrder(id) {
+      const r = await createNative({
+        orderId: id,
+        buyerAddr: buyer.address,
+        from: buyer,
+        amount,
+        fee: 0n,
+      });
+      await r.tx;
+      await escrow.connect(seller).confirmOrder(r.orderHash);
+      return r.orderHash;
+    }
+
+    it("records both deadlines, one window apart", async () => {
+      const h = await confirmedOrder("w-1");
+      const order = await escrow.getOrder(h);
+      expect(order.timeoutDeadline - order.settlementDeadline).to.equal(REFUND_WINDOW);
+      expect(order.settlementDeadline - order.createdAt).to.equal(REFUND_WINDOW);
+    });
+
+    it("phase 1: the seller can settle, the buyer cannot exit", async () => {
+      const h = await confirmedOrder("w-2");
+      await expect(escrow.connect(buyer).timeoutRefund(h)).to.be.revertedWithCustomError(
+        escrow,
+        "TimeoutNotReached"
+      );
+      await expect(escrow.connect(seller).completeOrder(h)).to.changeEtherBalance(
+        sellerPayout,
+        amount
+      );
+    });
+
+    it("phase 2: the seller is locked out and the buyer cannot exit yet", async () => {
+      const h = await confirmedOrder("w-3");
+      await time.increase(REFUND_WINDOW + 1);
+
+      await expect(escrow.connect(seller).completeOrder(h)).to.be.revertedWithCustomError(
+        escrow,
+        "SettlementWindowExpired"
+      );
+      await expect(escrow.connect(buyer).timeoutRefund(h)).to.be.revertedWithCustomError(
+        escrow,
+        "TimeoutNotReached"
+      );
+    });
+
+    it("phase 2: the owner can still arbitrate, for either party", async () => {
+      const toSeller = await confirmedOrder("w-4");
+      const toBuyer = await confirmedOrder("w-5");
+      await time.increase(REFUND_WINDOW + 1);
+
+      await expect(escrow.connect(owner).completeOrder(toSeller)).to.changeEtherBalance(
+        sellerPayout,
+        amount
+      );
+      await expect(escrow.connect(owner).refundOrder(toBuyer)).to.changeEtherBalance(
+        buyer,
+        amount
+      );
+    });
+
+    /**
+     * The regression this whole block exists for. Before the split there was a
+     * single deadline: {completeOrder} had no time check at all, so once the
+     * buyer's exit opened both were live and whoever's transaction landed first
+     * took the money.
+     */
+    it("phase 3: nobody may settle once the buyer's exit has opened", async () => {
+      const h = await confirmedOrder("w-6");
+      await time.increase(TIMEOUT_DEADLINE + 1);
+
+      for (const who of [seller, owner]) {
+        await expect(escrow.connect(who).completeOrder(h)).to.be.revertedWithCustomError(
+          escrow,
+          "RefundWindowExpired"
+        );
+        await expect(escrow.connect(who).refundOrder(h)).to.be.revertedWithCustomError(
+          escrow,
+          "RefundWindowExpired"
+        );
+      }
+
+      // And the buyer's exit is the one path that does work.
+      await expect(escrow.connect(buyer).timeoutRefund(h)).to.changeEtherBalance(buyer, amount);
+    });
+
+    it("the dispute window is configurable and only affects new orders", async () => {
+      const before = await confirmedOrder("w-7");
+      await escrow.connect(owner).setDisputeWindow(MIN_WINDOW);
+      const after = await confirmedOrder("w-8");
+
+      const o1 = await escrow.getOrder(before);
+      const o2 = await escrow.getOrder(after);
+      expect(o1.timeoutDeadline - o1.settlementDeadline).to.equal(REFUND_WINDOW);
+      expect(o2.timeoutDeadline - o2.settlementDeadline).to.equal(MIN_WINDOW);
+    });
+
+    it("only the owner can change the dispute window, and it is bounded", async () => {
+      await expect(escrow.connect(buyer).setDisputeWindow(REFUND_WINDOW)).to.be.reverted;
+      await expect(escrow.connect(owner).setDisputeWindow(1)).to.be.revertedWithCustomError(
+        escrow,
+        "InvalidRefundWindow"
       );
     });
   });

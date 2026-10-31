@@ -129,6 +129,11 @@ pub mod aeroledger_escrow {
         config.quote_authority = quote_authority;
         config.treasury = treasury;
         config.refund_window_secs = refund_window_secs;
+        // Defaults to the settlement window, so a buyer waits one further window
+        // before exiting unilaterally. Tunable through `set_config`; taking it as
+        // an initialize argument would change every deployment for a value most
+        // will leave alone.
+        config.dispute_window_secs = refund_window_secs;
         config.paused = false;
         config.bump = ctx.bumps.config;
 
@@ -150,6 +155,7 @@ pub mod aeroledger_escrow {
         quote_authority: Option<Pubkey>,
         treasury: Option<Pubkey>,
         refund_window_secs: Option<i64>,
+        dispute_window_secs: Option<i64>,
     ) -> Result<()> {
         let config = &mut ctx.accounts.config;
         if let Some(key) = quote_authority {
@@ -166,6 +172,13 @@ pub mod aeroledger_escrow {
                 EscrowError::InvalidRefundWindow
             );
             config.refund_window_secs = window;
+        }
+        if let Some(window) = dispute_window_secs {
+            require!(
+                (MIN_REFUND_WINDOW_SECS..=MAX_REFUND_WINDOW_SECS).contains(&window),
+                EscrowError::InvalidRefundWindow
+            );
+            config.dispute_window_secs = window;
         }
 
         emit!(ConfigUpdated {
@@ -361,8 +374,11 @@ pub mod aeroledger_escrow {
             &expected,
         )?;
 
-        let refund_deadline = now
+        let settlement_deadline = now
             .checked_add(ctx.accounts.config.refund_window_secs)
+            .ok_or(EscrowError::MathOverflow)?;
+        let timeout_deadline = settlement_deadline
+            .checked_add(ctx.accounts.config.dispute_window_secs)
             .ok_or(EscrowError::MathOverflow)?;
 
         let order = &mut ctx.accounts.order;
@@ -376,7 +392,8 @@ pub mod aeroledger_escrow {
         order.fee_amount = quote.fee_amount;
         order.status = OrderStatus::Pending;
         order.created_at = now;
-        order.refund_deadline = refund_deadline;
+        order.settlement_deadline = settlement_deadline;
+        order.timeout_deadline = timeout_deadline;
         order.quote_expiry = quote.expiry;
         order.order_id_hash = order_id_hash;
         order.order_id = order_id;
@@ -401,7 +418,8 @@ pub mod aeroledger_escrow {
             mint: order.mint,
             amount: order.amount,
             fee_amount: order.fee_amount,
-            refund_deadline,
+            settlement_deadline,
+            timeout_deadline,
         });
         Ok(())
     }
@@ -443,6 +461,22 @@ pub mod aeroledger_escrow {
         require!(
             authority == ctx.accounts.order.seller || authority == ctx.accounts.config.admin,
             EscrowError::Unauthorized
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        // Once the buyer's exit is open nobody may settle. This is what removes
+        // the race: `timeout_refund` and this are never live together.
+        require!(
+            now <= ctx.accounts.order.timeout_deadline,
+            EscrowError::RefundWindowExpired
+        );
+        // Between the two deadlines only the admin may act, as arbiter. A seller
+        // that is merely late goes through arbitration rather than racing the
+        // buyer for the funds.
+        require!(
+            now <= ctx.accounts.order.settlement_deadline
+                || authority == ctx.accounts.config.admin,
+            EscrowError::SettlementWindowExpired
         );
 
         let vault_balance = ctx.accounts.escrow_token_account.amount;
@@ -542,8 +576,13 @@ pub mod aeroledger_escrow {
 
         let now = Clock::get()?.unix_timestamp;
         require!(
-            now <= ctx.accounts.order.refund_deadline,
+            now <= ctx.accounts.order.timeout_deadline,
             EscrowError::RefundWindowExpired
+        );
+        require!(
+            now <= ctx.accounts.order.settlement_deadline
+                || ctx.accounts.authority.key() == ctx.accounts.config.admin,
+            EscrowError::SettlementWindowExpired
         );
 
         settle_refund(&mut ctx, RefundKind::Refund)
@@ -570,7 +609,7 @@ pub mod aeroledger_escrow {
 
         let now = Clock::get()?.unix_timestamp;
         require!(
-            now > ctx.accounts.order.refund_deadline,
+            now > ctx.accounts.order.timeout_deadline,
             EscrowError::TimeoutNotReached
         );
 
@@ -1064,9 +1103,17 @@ pub struct Config {
     pub quote_authority: Pubkey,
     /// Wallet whose ATA receives platform fees.
     pub treasury: Pubkey,
-    /// How long after creation an order stays refundable / before a buyer may
-    /// unilaterally time out.
+    /// The seller's window to settle a confirmed order, from creation.
     pub refund_window_secs: i64,
+    /// Arbitration window running after `refund_window_secs`, in which only the
+    /// admin may complete or refund. The buyer's unilateral exit opens when it
+    /// ends.
+    ///
+    /// Two windows rather than one: a single deadline left `complete_order` and
+    /// `timeout_refund` live at the same instant, so transaction ordering decided
+    /// who received the funds. Split, at any moment either settlement is possible
+    /// or the buyer's exit is, never both.
+    pub dispute_window_secs: i64,
     /// When true, no new orders may be created. Settlement and refunds continue.
     pub paused: bool,
     pub bump: u8,
@@ -1111,8 +1158,12 @@ pub struct Order {
     pub fee_amount: u64,
     pub status: OrderStatus,
     pub created_at: i64,
-    /// Refunds allowed up to here; the buyer's timeout exit opens after it.
-    pub refund_deadline: i64,
+    /// The seller's window to settle. After this only the admin may act, as
+    /// arbiter, until `timeout_deadline`.
+    pub settlement_deadline: i64,
+    /// After this the buyer may exit unilaterally and nobody else may act, so
+    /// settlement and the buyer's exit are never live at the same instant.
+    pub timeout_deadline: i64,
     /// Expiry of the quote that authorised this order (recorded for audit).
     pub quote_expiry: i64,
     /// keccak-256 of `order_id`; the PDA seed component.
@@ -1178,7 +1229,8 @@ pub struct OrderCreated {
     pub mint: Pubkey,
     pub amount: u64,
     pub fee_amount: u64,
-    pub refund_deadline: i64,
+    pub settlement_deadline: i64,
+    pub timeout_deadline: i64,
 }
 
 #[event]
@@ -1216,6 +1268,8 @@ pub enum EscrowError {
     CannotRefund,
     #[msg("Refund window has expired")]
     RefundWindowExpired,
+    #[msg("The seller's settlement window has passed; only the admin may act now")]
+    SettlementWindowExpired,
     #[msg("The refund deadline has not been reached yet")]
     TimeoutNotReached,
     #[msg("Unauthorized: signer is not the required authority")]
@@ -1274,8 +1328,9 @@ mod tests {
     #[test]
     fn account_sizes_match_their_field_layout() {
         // admin(32) + pending_admin Option<Pubkey>(1+32) + quote_authority(32)
-        // + treasury(32) + refund_window_secs(8) + paused(1) + bump(1)
-        assert_eq!(Config::INIT_SPACE, 32 + 33 + 32 + 32 + 8 + 1 + 1);
+        // + treasury(32) + refund_window_secs(8) + dispute_window_secs(8)
+        // + paused(1) + bump(1)
+        assert_eq!(Config::INIT_SPACE, 32 + 33 + 32 + 32 + 8 + 8 + 1 + 1);
 
         // mint(32) + decimals(1) + bump(1)
         assert_eq!(SupportedMint::INIT_SPACE, 32 + 1 + 1);
@@ -1283,11 +1338,12 @@ mod tests {
         // authority(32) + payout_wallet(32) + active(1) + bump(1)
         assert_eq!(Merchant::INIT_SPACE, 32 + 32 + 1 + 1);
 
-        // 5 pubkeys + amount(8) + fee(8) + status(1) + 3 timestamps(24)
+        // 5 pubkeys + amount(8) + fee(8) + status(1) + 4 timestamps(32)
+        // -- created_at, settlement_deadline, timeout_deadline, quote_expiry --
         // + order_id_hash(32) + String(4 + 64) + bump(1)
         assert_eq!(
             Order::INIT_SPACE,
-            32 * 5 + 8 + 8 + 1 + 24 + 32 + (4 + MAX_ORDER_ID_LEN) + 1
+            32 * 5 + 8 + 8 + 1 + 32 + 32 + (4 + MAX_ORDER_ID_LEN) + 1
         );
     }
 

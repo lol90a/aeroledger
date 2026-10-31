@@ -69,7 +69,12 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
         uint256 fee;           // Platform fee, carved out of `amount` at payout
         OrderStatus status;
         uint256 createdAt;
-        uint256 refundDeadline;
+        // The seller's window to settle. After this only the owner may act, as
+        // arbiter, until timeoutDeadline.
+        uint256 settlementDeadline;
+        // After this the buyer may exit unilaterally and nobody else may act, so
+        // settlement and the buyer's exit are never live at the same instant.
+        uint256 timeoutDeadline;
         string orderId;        // Backend order ID
     }
 
@@ -121,8 +126,19 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
     /// @notice Where platform fees are sent. Snapshotted into each order at creation.
     address public treasury;
 
-    /// @notice How long an order stays refundable, and when a buyer's timeout exit opens.
+    /// @notice The seller's window to settle a confirmed order, from creation.
     uint256 public refundWindow;
+
+    /// @notice Arbitration window that runs after {refundWindow}, during which only
+    ///         the owner may complete or refund. The buyer's unilateral exit opens
+    ///         when it ends.
+    ///
+    /// @dev These are two windows rather than one because a single deadline put
+    ///      {completeOrder} and {timeoutRefund} live at the same instant, leaving
+    ///      transaction ordering to decide who got the money. Separating them means
+    ///      at any moment either settlement is possible or the buyer's exit is,
+    ///      never both.
+    uint256 public disputeWindow;
 
     event OrderCreated(
         bytes32 indexed orderHash,
@@ -146,6 +162,7 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
     event QuoteSignerUpdated(address indexed previous, address indexed current);
     event TreasuryUpdated(address indexed previous, address indexed current);
     event RefundWindowUpdated(uint256 previous, uint256 current);
+    event DisputeWindowUpdated(uint256 previous, uint256 current);
 
     error ZeroAddress();
     error InvalidRefundWindow();
@@ -163,6 +180,8 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
     error InvalidQuoteSignature();
     error RefundWindowExpired();
     error TimeoutNotReached();
+    /// The seller's settlement window has passed; only the owner may act now.
+    error SettlementWindowExpired();
     error EscrowUnderflow();
     error NativeTransferFailed();
 
@@ -178,6 +197,11 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
         quoteSigner = initialQuoteSigner;
         treasury = initialTreasury;
         refundWindow = initialRefundWindow;
+        // Defaults to the settlement window, so a buyer waits one further window
+        // before exiting unilaterally. Tunable with {setDisputeWindow}; taking it
+        // as a constructor argument would have changed every deployment for a
+        // value most deployments will leave alone.
+        disputeWindow = initialRefundWindow;
 
         // Native coin is always escrowable and is not an ERC20.
         supportedTokens[NATIVE] = true;
@@ -186,6 +210,7 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
         emit QuoteSignerUpdated(address(0), initialQuoteSigner);
         emit TreasuryUpdated(address(0), initialTreasury);
         emit RefundWindowUpdated(0, initialRefundWindow);
+        emit DisputeWindowUpdated(0, initialRefundWindow);
     }
 
     // ---------------------------------------------------------------------
@@ -205,10 +230,20 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
         treasury = newTreasury;
     }
 
+    /// @dev Only affects orders created after this call; live orders keep the
+    ///      deadlines snapshotted at creation.
     function setRefundWindow(uint256 window) external onlyOwner {
         if (window < MIN_REFUND_WINDOW || window > MAX_REFUND_WINDOW) revert InvalidRefundWindow();
         emit RefundWindowUpdated(refundWindow, window);
         refundWindow = window;
+    }
+
+    /// @dev Same bounds as the settlement window, and likewise only affects orders
+    ///      created after this call.
+    function setDisputeWindow(uint256 window) external onlyOwner {
+        if (window < MIN_REFUND_WINDOW || window > MAX_REFUND_WINDOW) revert InvalidRefundWindow();
+        emit DisputeWindowUpdated(disputeWindow, window);
+        disputeWindow = window;
     }
 
     /// @notice Pause NEW order creation. Settlement, refunds and {timeoutRefund} stay
@@ -329,7 +364,8 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
             fee: q.fee,
             status: OrderStatus.Pending,
             createdAt: block.timestamp,
-            refundDeadline: block.timestamp + refundWindow,
+            settlementDeadline: block.timestamp + refundWindow,
+            timeoutDeadline: block.timestamp + refundWindow + disputeWindow,
             orderId: q.orderId
         });
     }
@@ -369,6 +405,16 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
         if (order.status != OrderStatus.Confirmed) revert InvalidStatus();
         if (msg.sender != order.seller && msg.sender != owner()) revert NotAuthorized();
 
+        // Once the buyer's exit is open, nobody may settle. This is what removes
+        // the race: {timeoutRefund} and this function are never live together.
+        if (block.timestamp > order.timeoutDeadline) revert RefundWindowExpired();
+        // Between the two deadlines only the owner may act, as arbiter. A seller
+        // that is simply late must go through arbitration rather than racing the
+        // buyer for the funds.
+        if (block.timestamp > order.settlementDeadline && msg.sender != owner()) {
+            revert SettlementWindowExpired();
+        }
+
         uint256 amount = order.amount;
         uint256 feeAmount = order.fee;
         uint256 sellerAmount = amount - feeAmount; // fee < amount enforced at creation
@@ -406,31 +452,30 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
             revert InvalidStatus();
         }
 
-        if (block.timestamp > order.refundDeadline) revert RefundWindowExpired();
+        if (block.timestamp > order.timeoutDeadline) revert RefundWindowExpired();
+        if (block.timestamp > order.settlementDeadline && msg.sender != owner()) {
+            revert SettlementWindowExpired();
+        }
         _settleRefund(orderHash, order, false);
     }
 
     /**
      * @notice Unilateral buyer exit. If the seller never confirms, or confirms and
-     *         never completes, the buyer reclaims their funds once the refund
-     *         deadline passes. Closes the "funds held hostage by inaction" gap.
+     *         never completes, the buyer reclaims their funds once `timeoutDeadline`
+     *         passes. Closes the "funds held hostage by inaction" gap.
      *
-     * @dev Known limitation, stated rather than hidden: after `refundDeadline`
-     *      passes on a Confirmed order, this and {completeOrder} are both live and
-     *      whichever transaction lands first decides the outcome. A seller who has
-     *      delivered but is slow to settle can lose the payment; a buyer entitled
-     *      to exit can lose it to a last-moment completion.
+     * @dev An order's life runs in three phases, and exactly one party set can act
+     *      in each, so no outcome is ever decided by transaction ordering:
      *
-     *      The cause is that `refundWindow` serves two purposes at once — how long
-     *      a refund is permitted, and when the buyer's exit opens — so the two
-     *      instants coincide and leave no gap in which only one party may act.
-     *      Nobody can receive funds they were not owed either way; what is wrong is
-     *      that the outcome is settled by transaction ordering rather than by rule.
+     *        t <= settlementDeadline   seller settles or refunds; owner may too
+     *        t <= timeoutDeadline      owner only, arbitrating a late settlement
+     *        t >  timeoutDeadline      buyer only, exiting unilaterally
      *
-     *      Fixing it properly means two separate deadlines: a settlement deadline
-     *      for the seller, and a later exit deadline for the buyer, with the gap
-     *      between them as the dispute window. That is a storage-layout change, so
-     *      it is deliberately not bolted on here.
+     *      An earlier version had a single deadline that both opened this function
+     *      and left {completeOrder} unbounded, so after it passed the two were live
+     *      together and whichever transaction landed first took the funds. Nobody
+     *      could receive money they were not owed, but a seller that had delivered
+     *      could lose payment to a fast buyer, and vice versa.
      */
     function timeoutRefund(bytes32 orderHash) external nonReentrant {
         Order storage order = _orders[orderHash];
@@ -438,7 +483,7 @@ contract AeroLedgerEscrow is ReentrancyGuard, Pausable, Ownable2Step, EIP712 {
             revert InvalidStatus();
         }
         if (msg.sender != order.buyer) revert NotAuthorized();
-        if (block.timestamp <= order.refundDeadline) revert TimeoutNotReached();
+        if (block.timestamp <= order.timeoutDeadline) revert TimeoutNotReached();
 
         _settleRefund(orderHash, order, true);
     }
