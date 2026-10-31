@@ -22,7 +22,7 @@ use std::time::Duration;
 const USER_AGENT: &str = concat!(
     "aeroledger-backend/",
     env!("CARGO_PKG_VERSION"),
-    " (+https://github.com/lol90a/areo_ledger)"
+    " (+https://github.com/lol90a/aeroledger)"
 );
 
 /// An HTTP client with the shared identity and an explicit timeout.

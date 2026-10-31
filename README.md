@@ -1,6 +1,6 @@
 # AeroLedger
 
-[![CI](https://github.com/lol90a/areo_ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/lol90a/areo_ledger/actions/workflows/ci.yml)
+[![CI](https://github.com/lol90a/aeroledger/actions/workflows/ci.yml/badge.svg)](https://github.com/lol90a/aeroledger/actions/workflows/ci.yml)
 
 A crypto-native commerce platform for private aviation charter and tokenized
 luxury assets. A buyer browses a catalogue, books a flight or an asset share, and
