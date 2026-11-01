@@ -369,7 +369,12 @@ INSERT INTO flights (id, route, origin, destination, aircraft, price_usd, durati
     ('00000000-0000-0000-0000-000000000003', 'LHR-DXB', 'London', 'Dubai', 'Airbus A380', 8500.00, '7h 15m', 6, NOW() + INTERVAL '5 days'),
     ('00000000-0000-0000-0000-000000000004', 'LHR-DXB', 'London', 'Dubai', 'Gulfstream G700', 53500.00, '7h 05m', 15, NOW() + INTERVAL '9 days'),
     ('00000000-0000-0000-0000-000000000005', 'LHR-DXB', 'London', 'Dubai', 'Dassault Falcon 8X', 47250.00, '6h 55m', 14, NOW() + INTERVAL '11 days'),
-    ('00000000-0000-0000-0000-000000000006', 'LHR-DXB', 'London', 'Dubai', 'Embraer Phenom 300E', 12400.00, '7h 40m', 7, NOW() + INTERVAL '13 days')
+    ('00000000-0000-0000-0000-000000000006', 'LHR-DXB', 'London', 'Dubai', 'Embraer Phenom 300E', 12400.00, '7h 40m', 7, NOW() + INTERVAL '13 days'),
+    -- A repositioning leg, priced per seat. Operators sell these cheaply because
+    -- the aircraft has to fly the route empty regardless. It is also the one
+    -- entry small enough to settle end-to-end against a test network, where the
+    -- faucet hands out a few SOL rather than the hundred a charter would need.
+    ('00000000-0000-0000-0000-000000000007', 'LTN-CDG', 'London Luton', 'Paris', 'Cessna Citation CJ3 (empty leg)', 300.00, '1h 20m', 4, NOW() + INTERVAL '2 days')
 ON CONFLICT (id) DO NOTHING;
 
 -- ── Seed Marketplace Assets ───────────────────────────────────────────────────
@@ -379,7 +384,11 @@ INSERT INTO assets (id, name, type, description, image, total_value, token_price
     ('00000000-0000-0000-0000-00000000a001', 'Gulfstream G700 Fractional Share', 'aircraft', 'Fractional ownership token in a flagship ultra-long-range business jet.', NULL, 78000000.00, 15500.00, 480, 5000, 8.40, 'Global'),
     ('00000000-0000-0000-0000-00000000a002', 'Bombardier Global 6000 Share', 'aircraft', 'Fractional ownership token in a long-range business jet.', NULL, 56000000.00, 11200.00, 610, 5000, 7.10, 'Global'),
     ('00000000-0000-0000-0000-00000000a003', 'Private Terminal Lounge Access', 'membership', 'Tokenized annual private-terminal lounge membership.', NULL, 4200000.00, 4200.00, 1000, 1000, 3.20, 'DXB'),
-    ('00000000-0000-0000-0000-00000000a004', 'Rolls-Royce Phantom Fleet Token', 'vehicle', 'Tokenized share in a chauffeured luxury ground-fleet.', NULL, 9600000.00, 9600.00, 750, 1000, 5.50, 'LON')
+    ('00000000-0000-0000-0000-00000000a004', 'Rolls-Royce Phantom Fleet Token', 'vehicle', 'Tokenized share in a chauffeured luxury ground-fleet.', NULL, 9600000.00, 9600.00, 750, 1000, 5.50, 'LON'),
+    -- Lowest-denomination entry, for the same reason as the empty leg above:
+    -- a test-network faucet cannot fund a five-figure purchase. total_value
+    -- divided by total_tokens equals token_price, as it does for every row here.
+    ('00000000-0000-0000-0000-00000000a005', 'Private Terminal Day Pass', 'membership', 'Single-day private terminal and lounge access, tokenized per day.', NULL, 150000.00, 150.00, 1000, 1000, 2.10, 'DXB')
 ON CONFLICT (id) DO NOTHING;
 
 
