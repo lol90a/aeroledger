@@ -474,8 +474,7 @@ pub mod aeroledger_escrow {
         // that is merely late goes through arbitration rather than racing the
         // buyer for the funds.
         require!(
-            now <= ctx.accounts.order.settlement_deadline
-                || authority == ctx.accounts.config.admin,
+            now <= ctx.accounts.order.settlement_deadline || authority == ctx.accounts.config.admin,
             EscrowError::SettlementWindowExpired
         );
 
