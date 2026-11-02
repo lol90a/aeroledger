@@ -8,6 +8,7 @@ use areo_ledger::infrastructure::blockchain::solana_gateway::SolanaGateway;
 use areo_ledger::infrastructure::config::AppConfig;
 use areo_ledger::infrastructure::db::{init_pool, run_migrations};
 use areo_ledger::infrastructure::pricing::market_price_oracle::MarketPriceOracle;
+use areo_ledger::infrastructure::workers::escrow_reconciliation::EscrowReconciliationWorker;
 use areo_ledger::infrastructure::workers::payment_reconciliation::PaymentReconciliationWorker;
 use areo_ledger::interfaces::http::handlers::{
     booking_handler, catalog_handler, health_handler, payment_handler, transaction_handler,
@@ -132,6 +133,20 @@ async fn main() -> std::io::Result<()> {
         config.reconciliation_interval_seconds,
     )
     .spawn();
+
+    // An escrow order is confirmed, completed or refunded by the seller, an
+    // admin, or the buyer themselves after the timeout -- none of which goes
+    // through this backend. Without a sweep the database would record every
+    // order exactly as it looked when it was funded, and a refunded booking
+    // would read as paid forever.
+    if let Some(runtime) = escrow_runtime.get_ref() {
+        EscrowReconciliationWorker::new(
+            pool.clone(),
+            runtime.gateway.clone(),
+            config.reconciliation_interval_seconds,
+        )
+        .spawn();
+    }
     let multichain_gateway = web::Data::new(multichain_gateway);
 
     let price_oracle: Arc<dyn PriceOracle> = Arc::new(MarketPriceOracle::new(

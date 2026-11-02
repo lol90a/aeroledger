@@ -131,6 +131,27 @@ impl Payment {
             )),
         }
     }
+
+    /// An escrow refund was observed: the money went back to the buyer, so this
+    /// payment no longer settles anything.
+    ///
+    /// Returns whether the status actually moved, so a reconciliation sweep that
+    /// re-reads the same refund does not write on every cycle.
+    ///
+    /// `Failed` rather than a `Refunded` variant of its own, and the trade-off
+    /// is worth naming: `payments.status` is read by everything that does not
+    /// know escrow exists, and the only thing those readers need to know is
+    /// that this booking is not settled. The precise state, including when the
+    /// refund was seen, lives on the escrow order record. A fourth variant
+    /// would have to be understood by every one of those readers to buy
+    /// anything.
+    pub fn mark_refunded(&mut self) -> bool {
+        if self.status == PaymentStatus::Failed {
+            return false;
+        }
+        self.status = PaymentStatus::Failed;
+        true
+    }
 }
 
 #[cfg(test)]
