@@ -244,12 +244,13 @@ TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/postgres \
 # Solana program unit tests
 cd contracts/solana && cargo test --lib
 
-# Solana integration tests against a local validator.
-# The suite's "frontend escrow client" block imports the browser's own modules
-# from Frontend/, so that the code customers run is what gets tested against the
-# validator rather than a mirror of it. Node resolves those imports against
-# Frontend/node_modules, so both installs are needed.
-cd Frontend && npm ci && cd ../contracts/solana && yarn install --frozen-lockfile && anchor test
+# Solana integration tests against a local validator
+cd contracts/solana && yarn install --frozen-lockfile && anchor test
+
+# Regenerate the fixture of browser-emitted escrow bytes that the Anchor suite
+# checks against the program's own encoding. Only needed when the escrow wire
+# format changes; the frontend suite fails if the committed copy is stale.
+cd Frontend && npx vite-node scripts/emit-escrow-fixture.ts
 
 # EVM contract tests
 cd contracts/ethereum && npm ci && npx hardhat test

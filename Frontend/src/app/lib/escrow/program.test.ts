@@ -8,6 +8,8 @@
 // The golden vector is the Rust program's own output, imported verbatim rather
 // than copied. `?raw` keeps this a build-time read, so no Node filesystem types
 // leak into a project whose other sources must stay browser-only.
+import { buildFixture } from "../../../../scripts/escrow-fixture";
+import COMMITTED_FIXTURE from "../../../../../contracts/solana/tests/fixtures/browser-create-order.json";
 import GOLDEN_HEX from "../../../../../contracts/solana/programs/aeroledger-escrow/src/quote_golden.txt?raw";
 import {
   Keypair,
@@ -416,5 +418,22 @@ describe("buildCreateOrderInstruction", () => {
     expect(ix.programId.toBase58()).toBe(PROGRAM_ID.toBase58());
     expect(ix.keys).toHaveLength(16);
     expect(hex(new Uint8Array(ix.data.subarray(0, 8)))).toBe("8d3625cfedd2fad7");
+  });
+});
+
+/**
+ * The Anchor suite cannot import these modules: its package pins ts-node 7,
+ * whose loader predates `moduleTypes`, so a `.ts` file under a `"type":
+ * "module"` package resolves as ESM and the whole suite falls off its CommonJS
+ * loader. It reads a committed fixture of these bytes instead, and checks them
+ * against the program's own encoding.
+ *
+ * A fixture only works if it is current. This is what keeps it honest: if the
+ * encoding changes and nobody regenerates, the browser's own suite fails here
+ * and says what to run.
+ */
+describe("the fixture the Anchor suite checks against", () => {
+  it("still matches what this code emits", () => {
+    expect(buildFixture()).toEqual(COMMITTED_FIXTURE);
   });
 });

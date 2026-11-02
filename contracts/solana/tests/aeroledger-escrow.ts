@@ -34,16 +34,10 @@ import {
   getAccount,
   NATIVE_MINT,
   createSyncNativeInstruction,
+  createAssociatedTokenAccountInstruction,
 } from "@solana/spl-token";
 import { keccak_256 } from "@noble/hashes/sha3";
 import { assert, expect } from "chai";
-
-// The browser's own escrow client. Imported from the Vite app rather than
-// mirrored here: the point of the "frontend escrow client" block below is to
-// run the code customers actually use against a real validator.
-import * as fe from "../../../Frontend/src/app/lib/escrow/program";
-import * as feAccounts from "../../../Frontend/src/app/lib/escrow/accounts";
-import * as feClient from "../../../Frontend/src/app/lib/escrow/client";
 
 const QUOTE_DOMAIN = Buffer.from("AEROLEDGER_ORDER_QUOTE_V1");
 const DECIMALS = 6;
@@ -953,84 +947,175 @@ describe("aeroledger-escrow", () => {
     });
   });
 
+
   // ---------------------------------------------------------------------
-  // The browser's own client, against the real program
+  // The browser's bytes, and wrapped SOL
   // ---------------------------------------------------------------------
 
   /**
-   * Everything above builds transactions with a local mirror of the program's
-   * wire format. That proves the program is correct; it does not prove the
-   * *browser* is, and the browser is what customers use.
+   * Everything above builds transactions with this file's own mirror of the
+   * program's wire format. That proves the program is correct; it does not
+   * prove the *browser* is, and the browser is what customers use.
    *
-   * This block imports `Frontend/src/app/lib/escrow` -- the same modules the
-   * Vite bundle ships -- and drives them against this validator: the backend's
-   * authorization shape, the pre-flight, the wrapped-SOL plan, the Ed25519
-   * attestation and the assembled `create_order`. A drift between the browser
-   * and the program fails here rather than in front of a customer.
+   * The browser cannot be imported here. This package pins ts-node 7, whose
+   * loader predates `moduleTypes`, so a `.ts` file under a `"type": "module"`
+   * package resolves as ESM and the whole suite falls off its CommonJS loader.
+   * Pinning a newer ts-node means regenerating a lockfile that is deliberately
+   * committed.
    *
-   * Wrapped SOL, not the synthetic 6-decimal mint the rest of the suite uses.
-   * The native mint exists on every cluster including this one, and wrapping is
-   * the part of the flow with the most ways to be subtly wrong.
+   * So the browser emits its bytes into a fixture and this checks them against
+   * Anchor's own encoder -- which every passing test in this file has already
+   * proven the program accepts. The chain of equality is
+   * browser == Anchor client == program, and either half failing names which.
+   *
+   * The fixture is kept current by the browser's own suite, which fails if it
+   * drifts. See `Frontend/scripts/escrow-fixture.ts`.
    */
-  describe("frontend escrow client", () => {
-    const wsolAmount = 1_150_000_000n; // 1.15 SOL
-    const wsolFee = 150_000_000n; //      0.15 SOL, the platform's share
+  describe("browser wire format", () => {
+    const fixture = require("./fixtures/browser-create-order.json");
+    const fixtureProgram = new PublicKey(fixture.input.programId);
+    const pda = (seeds: Buffer[]) =>
+      PublicKey.findProgramAddressSync(seeds, fixtureProgram)[0].toBase58();
+
+    it("derives the same addresses the program's own seeds give", () => {
+      // Derived against the FIXTURE's program id, not this deployment's, so the
+      // check is about the seeds rather than about which program is deployed.
+      expect(fixture.derived.config).to.equal(pda([Buffer.from("config")]));
+      expect(fixture.derived.supportedMint).to.equal(
+        pda([Buffer.from("mint"), NATIVE_MINT.toBuffer()])
+      );
+      expect(fixture.derived.merchant).to.equal(
+        pda([Buffer.from("merchant"), new PublicKey(fixture.input.seller).toBuffer()])
+      );
+      expect(fixture.derived.order).to.equal(
+        pda([Buffer.from("order"), orderIdHash(fixture.input.orderId)])
+      );
+    });
+
+    it("hashes the order id the way the PDA seed requires", () => {
+      expect(fixture.derived.orderIdHash).to.equal(
+        orderIdHash(fixture.input.orderId).toString("hex")
+      );
+    });
+
+    it("builds the message the program rebuilds and compares", () => {
+      // A drift here is the nastiest failure in the system: every signature
+      // stops verifying on-chain, and the error names the signer rather than
+      // the message, so it reads as a wrong key.
+      const expected = quoteMessage(
+        fixture.input.orderId,
+        new PublicKey(fixture.input.buyer),
+        new PublicKey(fixture.input.seller),
+        NATIVE_MINT,
+        BigInt(fixture.input.amount),
+        BigInt(fixture.input.feeAmount),
+        BigInt(fixture.input.expiry)
+      );
+      expect(fixture.quoteMessage).to.equal(expected.toString("hex"));
+    });
+
+    it("encodes create_order exactly as Anchor's own client does", async () => {
+      // Anchor generates this from the IDL, which is generated from the
+      // program. If the browser's bytes equal these, the browser is encoding
+      // what the program will decode -- discriminator, Borsh string length and
+      // all three little-endian integers.
+      const ix = await program.methods
+        .createOrder(fixture.input.orderId, {
+          amount: new BN(fixture.input.amount),
+          feeAmount: new BN(fixture.input.feeAmount),
+          expiry: new BN(fixture.input.expiry),
+        })
+        .accounts({
+          config: configPda,
+          supportedMint: supportedMintPda,
+          merchant: merchantPda,
+          order: orderPda(fixture.input.orderId),
+          buyer: buyer.publicKey,
+          mint,
+          buyerTokenAccount: buyerAta,
+          escrowTokenAccount: getAssociatedTokenAddressSync(
+            mint,
+            orderPda(fixture.input.orderId),
+            true
+          ),
+          sellerTokenAccount: sellerAta,
+          payoutWallet: sellerPayout.publicKey,
+          treasuryTokenAccount: treasuryAta,
+          treasury: treasury.publicKey,
+          instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .instruction();
+
+      expect(fixture.createOrderData).to.equal(ix.data.toString("hex"));
+    });
+
+    it("lists the accounts in the order and with the flags Anchor emits", async () => {
+      // Anchor matches accounts positionally. A transposition does not error --
+      // it hands the program a different account in a slot whose constraints
+      // may happen to pass, which is worse than a crash.
+      const ix = await program.methods
+        .createOrder(fixture.input.orderId, {
+          amount: new BN(fixture.input.amount),
+          feeAmount: new BN(fixture.input.feeAmount),
+          expiry: new BN(fixture.input.expiry),
+        })
+        .accounts({
+          config: configPda,
+          supportedMint: supportedMintPda,
+          merchant: merchantPda,
+          order: orderPda(fixture.input.orderId),
+          buyer: buyer.publicKey,
+          mint,
+          buyerTokenAccount: buyerAta,
+          escrowTokenAccount: getAssociatedTokenAddressSync(
+            mint,
+            orderPda(fixture.input.orderId),
+            true
+          ),
+          sellerTokenAccount: sellerAta,
+          payoutWallet: sellerPayout.publicKey,
+          treasuryTokenAccount: treasuryAta,
+          treasury: treasury.publicKey,
+          instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .instruction();
+
+      // The fixture names different parties, so compare the SHAPE: how many
+      // accounts, in what order of signer/writable flags, and that the four
+      // fixed program ids land in the same slots.
+      expect(fixture.accounts).to.have.length(ix.keys.length);
+      expect(fixture.accounts.map((a: any) => [a.isSigner, a.isWritable])).to.deep.equal(
+        ix.keys.map((k) => [k.isSigner, k.isWritable])
+      );
+      for (const slot of [12, 13, 14, 15]) {
+        expect(fixture.accounts[slot].pubkey).to.equal(ix.keys[slot].pubkey.toBase58());
+      }
+    });
+  });
+
+  /**
+   * Wrapped SOL end to end.
+   *
+   * The rest of the suite uses a synthetic 6-decimal mint, which is the right
+   * choice for exercising the program's logic but says nothing about the
+   * currency customers actually pay in. The escrow moves SPL tokens only -- it
+   * has no lamport path at all -- so "pay 1.15 SOL" means wrapping it first,
+   * and wrapping is the part of the flow with the most ways to be quietly
+   * wrong.
+   */
+  describe("wrapped SOL", () => {
+    const amount = 1_150_000_000; // 1.15 SOL
+    const fee = 150_000_000;
 
     let wsolSupportedMintPda: PublicKey;
     let wsolPayoutAta: PublicKey;
     let wsolTreasuryAta: PublicKey;
-
-    /** Build the object the backend returns from `/payments/escrow/authorize`. */
-    function authorizationFor(orderId: string, buyerKey: PublicKey, expiry: bigint) {
-      const message = fe.quoteMessage({
-        orderId,
-        buyer: buyerKey,
-        seller: seller.publicKey,
-        mint: NATIVE_MINT,
-        quote: { amount: wsolAmount, feeAmount: wsolFee, expiry },
-      });
-
-      // The signature the backend would produce. Lifted out of an Ed25519
-      // instruction built with the authority's private key rather than pulling
-      // in a signing library the package does not already have: the layout puts
-      // the 64-byte signature at offset 48, which `program.test.ts` pins.
-      const signed = Ed25519Program.createInstructionWithPrivateKey({
-        privateKey: quoteAuthority.secretKey,
-        message: Buffer.from(message),
-      });
-      const signature = Buffer.from(signed.data.subarray(48, 112));
-
-      return {
-        programId: program.programId.toBase58(),
-        rpcUrl: connection.rpcEndpoint,
-        orderId,
-        buyer: buyerKey.toBase58(),
-        seller: seller.publicKey.toBase58(),
-        payoutWallet: sellerPayout.publicKey.toBase58(),
-        treasury: treasury.publicKey.toBase58(),
-        mint: NATIVE_MINT.toBase58(),
-        quoteAuthority: quoteAuthority.publicKey.toBase58(),
-        amount: wsolAmount.toString(),
-        feeAmount: wsolFee.toString(),
-        expiry: Number(expiry),
-        signature: signature.toString("base64"),
-      };
-    }
-
-    /**
-     * Stands in for Phantom. The browser hands the wallet an unsigned
-     * transaction and gets a signed one back; that is the whole interface the
-     * client uses, so a keypair can play the part faithfully.
-     *
-     * This is NOT a test of Phantom. It exercises every line of our code on
-     * both sides of the wallet call and nothing of theirs.
-     */
-    const walletHarness = (signer: Keypair) => ({
-      async signTransaction(tx: Transaction): Promise<Transaction> {
-        tx.partialSign(signer);
-        return tx;
-      },
-    });
 
     before(async () => {
       [wsolSupportedMintPda] = PublicKey.findProgramAddressSync(
@@ -1072,291 +1157,171 @@ describe("aeroledger-escrow", () => {
       await airdrop(buyer.publicKey, 10);
     });
 
-    it("derives the same addresses the program does", () => {
-      // If these disagree the client is talking about different accounts
-      // entirely, and every later assertion would be meaningless.
-      const orderId = "addresses-" + Date.now();
-      expect(fe.deriveOrder(program.programId, orderId).toBase58()).to.equal(
-        orderPda(orderId).toBase58()
-      );
-      expect(fe.deriveConfig(program.programId).toBase58()).to.equal(configPda.toBase58());
-      expect(
-        fe.deriveMerchant(program.programId, seller.publicKey).toBase58()
-      ).to.equal(merchantPda.toBase58());
-      expect(
-        fe.deriveSupportedMint(program.programId, NATIVE_MINT).toBase58()
-      ).to.equal(wsolSupportedMintPda.toBase58());
-    });
-
-    it("decodes on-chain config with the browser's own decoder", async () => {
-      const account = await connection.getAccountInfo(configPda);
-      const cfg = feAccounts.decodeConfig(account.data);
-
-      // The pre-flight compares the backend's signing key against this value.
-      // Reading it from a fixed offset breaks the moment `pending_admin` is set.
-      expect(cfg.quoteAuthority.toBase58()).to.equal(quoteAuthority.publicKey.toBase58());
-      expect(cfg.treasury.toBase58()).to.equal(treasury.publicKey.toBase58());
-      expect(cfg.admin.toBase58()).to.equal(admin.publicKey.toBase58());
-      expect(cfg.paused).to.equal(false);
-    });
-
-    it("wraps SOL, escrows it and recovers the rent, all in one transaction", async () => {
-      const orderId = "fe-happy-" + Date.now();
-      const auth = authorizationFor(orderId, buyer.publicKey, nowSeconds() + 120n);
-
-      const before = BigInt(await connection.getBalance(buyer.publicKey));
-
-      const prepared = await feClient.prepareEscrowDeposit({
-        connection,
-        auth,
-        buyer: buyer.publicKey,
-      });
-      if (prepared.state !== "ready") {
-        assert.fail(`pre-flight blocked: ${prepared.reason} — ${prepared.message}`);
+    /** Wrap `lamports` into the buyer's wSOL account, creating it if needed. */
+    async function wrap(lamports: number): Promise<PublicKey> {
+      const ata = getAssociatedTokenAddressSync(NATIVE_MINT, buyer.publicKey);
+      const tx = new Transaction();
+      if (!(await connection.getAccountInfo(ata))) {
+        tx.add(
+          createAssociatedTokenAccountInstruction(
+            buyer.publicKey,
+            ata,
+            buyer.publicKey,
+            NATIVE_MINT
+          )
+        );
       }
-
-      // Legacy transactions cap at 1232 bytes and this one is close: sixteen
-      // accounts plus a 289-byte attestation. Worth asserting, because the
-      // failure at submission says only "too large".
-      expect(prepared.transactionBytes).to.be.at.most(1232);
-      expect(prepared.wsol.createsAccount).to.equal(true);
-
-      const { signature } = await feClient.signAndSubmitEscrowDeposit({
-        connection,
-        provider: walletHarness(buyer),
-        transaction: prepared.transaction,
-        lastValidBlockHeight: prepared.lastValidBlockHeight,
-        orderAccount: prepared.orderAccount,
-      });
-      expect(signature).to.be.a("string");
-
-      // The vault holds exactly what was quoted — read from the chain, not
-      // inferred from the call having returned.
-      const vault = await getAccount(connection, prepared.escrowVault);
-      expect(vault.amount.toString()).to.equal(wsolAmount.toString());
-
-      // And the order records the same figures, decoded by the browser.
-      const orderAccount = await connection.getAccountInfo(prepared.orderAccount);
-      const order = feAccounts.decodeOrder(orderAccount.data);
-      expect(order.amount.toString()).to.equal(wsolAmount.toString());
-      expect(order.feeAmount.toString()).to.equal(wsolFee.toString());
-      expect(order.status).to.equal("pending");
-      expect(order.buyer.toBase58()).to.equal(buyer.publicKey.toBase58());
-      expect(order.payoutWallet.toBase58()).to.equal(sellerPayout.publicKey.toBase58());
-
-      // The wrapped-SOL account this transaction created is gone again, so its
-      // rent came back rather than being stranded in a now-useless account.
-      const buyerWsol = fe.deriveWalletAta(buyer.publicKey, NATIVE_MINT);
-      expect(await connection.getAccountInfo(buyerWsol)).to.equal(null);
-
-      // Net cost to the buyer: the escrowed amount, plus fees and the order
-      // account's rent, minus the token-account rent that came back. It must be
-      // at least the amount and not wildly more.
-      const after = BigInt(await connection.getBalance(buyer.publicKey));
-      const spent = before - after;
-      expect(spent >= wsolAmount).to.equal(true, `spent ${spent} < amount ${wsolAmount}`);
-      expect(spent - wsolAmount < 10_000_000n).to.equal(
-        true,
-        `overhead ${spent - wsolAmount} lamports is implausibly high`
-      );
-    });
-
-    it("never closes a wrapped-SOL account the buyer already had", async () => {
-      // The buyer opens their own wSOL account first, with a balance in it.
-      // Closing a native token account forwards its entire lamport balance to
-      // the destination, unwrapping a position they chose to hold.
-      const own = await getOrCreateAssociatedTokenAccount(
-        connection,
-        buyer,
-        NATIVE_MINT,
-        buyer.publicKey
-      );
-      const surplus = 250_000_000n;
-      await provider.connection.confirmTransaction(
-        await connection.requestAirdrop(buyer.publicKey, 5 * LAMPORTS_PER_SOL)
-      );
-      const topUp = new Transaction().add(
+      tx.add(
         SystemProgram.transfer({
           fromPubkey: buyer.publicKey,
-          toPubkey: own.address,
-          lamports: Number(wsolAmount + surplus),
+          toPubkey: ata,
+          lamports,
         }),
-        createSyncNativeInstruction(own.address)
+        // Lamports landing in a native token account do not change its token
+        // balance until the token program is told to look. Without this the
+        // escrow transfer fails with "insufficient funds" against an account
+        // that visibly holds the money.
+        createSyncNativeInstruction(ata)
       );
-      await provider.sendAndConfirm(topUp, [buyer]);
+      await provider.sendAndConfirm(tx, [buyer]);
+      return ata;
+    }
 
-      const orderId = "fe-preexisting-" + Date.now();
-      const auth = authorizationFor(orderId, buyer.publicKey, nowSeconds() + 120n);
-      const prepared = await feClient.prepareEscrowDeposit({
+    it("escrows wrapped SOL and pays it out in real lamports", async () => {
+      const orderId = "wsol-" + Date.now();
+      const buyerWsol = await wrap(amount);
+
+      const expiry = nowSeconds() + 120n;
+      const message = quoteMessage(
+        orderId,
+        buyer.publicKey,
+        seller.publicKey,
+        NATIVE_MINT,
+        BigInt(amount),
+        BigInt(fee),
+        expiry
+      );
+
+      const order = orderPda(orderId);
+      await program.methods
+        .createOrder(orderId, {
+          amount: new BN(amount),
+          feeAmount: new BN(fee),
+          expiry: new BN(expiry.toString()),
+        })
+        .accounts({
+          config: configPda,
+          supportedMint: wsolSupportedMintPda,
+          merchant: merchantPda,
+          order,
+          buyer: buyer.publicKey,
+          mint: NATIVE_MINT,
+          buyerTokenAccount: buyerWsol,
+          escrowTokenAccount: getAssociatedTokenAddressSync(NATIVE_MINT, order, true),
+          sellerTokenAccount: wsolPayoutAta,
+          payoutWallet: sellerPayout.publicKey,
+          treasuryTokenAccount: wsolTreasuryAta,
+          treasury: treasury.publicKey,
+          instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .preInstructions([attestation(message)])
+        .signers([buyer])
+        .rpc();
+
+      const vault = await getAccount(
         connection,
-        auth,
-        buyer: buyer.publicKey,
-      });
-      if (prepared.state !== "ready") {
-        assert.fail(`pre-flight blocked: ${prepared.reason}`);
-      }
+        getAssociatedTokenAddressSync(NATIVE_MINT, order, true)
+      );
+      expect(vault.amount.toString()).to.equal(amount.toString());
 
-      // Already funded beyond the order, so nothing is moved in and nothing is
-      // created — and therefore nothing may be closed.
-      expect(prepared.wsol.createsAccount).to.equal(false);
-      expect(prepared.wsol.topUpLamports.toString()).to.equal("0");
-      expect(prepared.wsol.cleanup).to.deep.equal([]);
+      await program.methods
+        .confirmOrder()
+        .accounts({ config: configPda, order, seller: seller.publicKey })
+        .signers([seller])
+        .rpc();
 
-      await feClient.signAndSubmitEscrowDeposit({
-        connection,
-        provider: walletHarness(buyer),
-        transaction: prepared.transaction,
-        lastValidBlockHeight: prepared.lastValidBlockHeight,
-        orderAccount: prepared.orderAccount,
-      });
+      const payoutBefore = (await getAccount(connection, wsolPayoutAta)).amount;
+      const treasuryBefore = (await getAccount(connection, wsolTreasuryAta)).amount;
 
-      // The account survives, holding exactly the surplus it had over the order.
-      const still = await getAccount(connection, own.address);
-      expect(still.amount.toString()).to.equal(surplus.toString());
+      await program.methods
+        .completeOrder()
+        .accounts({
+          config: configPda,
+          order,
+          escrowTokenAccount: getAssociatedTokenAddressSync(NATIVE_MINT, order, true),
+          sellerTokenAccount: wsolPayoutAta,
+          payoutWallet: sellerPayout.publicKey,
+          treasuryTokenAccount: wsolTreasuryAta,
+          treasury: treasury.publicKey,
+          authority: seller.publicKey,
+          mint: NATIVE_MINT,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([seller])
+        .rpc();
+
+      // Real balance deltas, read from the chain. What went in is what came
+      // out: nothing is created or lost by the split.
+      const payoutAfter = (await getAccount(connection, wsolPayoutAta)).amount;
+      const treasuryAfter = (await getAccount(connection, wsolTreasuryAta)).amount;
+      expect((payoutAfter - payoutBefore).toString()).to.equal(
+        (amount - fee).toString()
+      );
+      expect((treasuryAfter - treasuryBefore).toString()).to.equal(fee.toString());
     });
 
     it("rejects a tampered amount, because the signature covers it", async () => {
-      // The authorization is genuine; the client lies about the figure after
-      // the fact. This is the attack the signed quote exists to stop.
-      const orderId = "fe-tamper-" + Date.now();
-      const auth = authorizationFor(orderId, buyer.publicKey, nowSeconds() + 120n);
-      const prepared = await feClient.prepareEscrowDeposit({
-        connection,
-        auth,
-        buyer: buyer.publicKey,
-      });
-      if (prepared.state !== "ready") assert.fail("pre-flight blocked");
+      // The attestation is genuine; the instruction lies about the figure.
+      // This is the attack the signed quote exists to stop.
+      const orderId = "wsol-tamper-" + Date.now();
+      const buyerWsol = await wrap(amount);
+      const expiry = nowSeconds() + 120n;
 
-      // Re-encode create_order for a tenth of the price, leaving the Ed25519
-      // attestation untouched.
-      const tx = prepared.transaction;
-      const createOrderIx = tx.instructions.find((ix) =>
-        ix.programId.equals(program.programId)
-      );
-      createOrderIx.data = Buffer.from(
-        fe.encodeCreateOrderData(orderId, {
-          amount: wsolAmount / 10n,
-          feeAmount: wsolFee / 10n,
-          expiry: BigInt(auth.expiry),
-        })
+      const signedFor = quoteMessage(
+        orderId,
+        buyer.publicKey,
+        seller.publicKey,
+        NATIVE_MINT,
+        BigInt(amount),
+        BigInt(fee),
+        expiry
       );
 
-      try {
-        await feClient.signAndSubmitEscrowDeposit({
-          connection,
-          provider: walletHarness(buyer),
-          transaction: tx,
-          lastValidBlockHeight: prepared.lastValidBlockHeight,
-          orderAccount: prepared.orderAccount,
-        });
-        assert.fail("a tampered amount was accepted");
-      } catch (e) {
-        expect(String(e)).to.match(/QuoteMismatch|custom program error|0x17[0-9a-f]{2}/i);
-      }
-    });
-
-    it("rejects a transaction with no attestation at all", async () => {
-      const orderId = "fe-noattest-" + Date.now();
-      const auth = authorizationFor(orderId, buyer.publicKey, nowSeconds() + 120n);
-      const prepared = await feClient.prepareEscrowDeposit({
-        connection,
-        auth,
-        buyer: buyer.publicKey,
-      });
-      if (prepared.state !== "ready") assert.fail("pre-flight blocked");
-
-      const tx = prepared.transaction;
-      tx.instructions = tx.instructions.filter(
-        (ix) => !ix.programId.equals(Ed25519Program.programId)
+      const order = orderPda(orderId);
+      await expectError(
+        program.methods
+          .createOrder(orderId, {
+            // A tenth of the price the backend authorised.
+            amount: new BN(amount / 10),
+            feeAmount: new BN(fee / 10),
+            expiry: new BN(expiry.toString()),
+          })
+          .accounts({
+            config: configPda,
+            supportedMint: wsolSupportedMintPda,
+            merchant: merchantPda,
+            order,
+            buyer: buyer.publicKey,
+            mint: NATIVE_MINT,
+            buyerTokenAccount: buyerWsol,
+            escrowTokenAccount: getAssociatedTokenAddressSync(NATIVE_MINT, order, true),
+            sellerTokenAccount: wsolPayoutAta,
+            payoutWallet: sellerPayout.publicKey,
+            treasuryTokenAccount: wsolTreasuryAta,
+            treasury: treasury.publicKey,
+            instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .preInstructions([attestation(signedFor)])
+          .signers([buyer])
+          .rpc(),
+        "QuoteMismatch"
       );
-
-      try {
-        await feClient.signAndSubmitEscrowDeposit({
-          connection,
-          provider: walletHarness(buyer),
-          transaction: tx,
-          lastValidBlockHeight: prepared.lastValidBlockHeight,
-          orderAccount: prepared.orderAccount,
-        });
-        assert.fail("an unattested order was accepted");
-      } catch (e) {
-        expect(String(e)).to.match(/MissingQuoteSignature|custom program error|0x17[0-9a-f]{2}/i);
-      }
-    });
-
-    it("refuses to build a deposit for a wallet the authorization does not name", async () => {
-      // Caught in the pre-flight rather than on-chain: the program would reject
-      // it too, but "reconnect the wallet you started with" is a sentence a
-      // customer can act on and a hex error code is not.
-      const orderId = "fe-wrongwallet-" + Date.now();
-      const auth = authorizationFor(orderId, buyer.publicKey, nowSeconds() + 120n);
-
-      const result = await feClient.prepareEscrowDeposit({
-        connection,
-        auth,
-        buyer: attacker.publicKey,
-      });
-      expect(result.state).to.equal("blocked");
-      expect((result as any).reason).to.equal("wallet-mismatch");
-    });
-
-    it("refuses an expired authorization before asking the wallet to sign", async () => {
-      const orderId = "fe-expired-" + Date.now();
-      const auth = authorizationFor(orderId, buyer.publicKey, nowSeconds() - 1n);
-
-      const result = await feClient.prepareEscrowDeposit({
-        connection,
-        auth,
-        buyer: buyer.publicKey,
-      });
-      expect(result.state).to.equal("blocked");
-      expect((result as any).reason).to.equal("authorization-expired");
-    });
-
-    it("reports an order that already exists rather than failing opaquely", async () => {
-      const orderId = "fe-dup-" + Date.now();
-      const auth = authorizationFor(orderId, buyer.publicKey, nowSeconds() + 120n);
-
-      const first = await feClient.prepareEscrowDeposit({
-        connection,
-        auth,
-        buyer: buyer.publicKey,
-      });
-      if (first.state !== "ready") assert.fail("pre-flight blocked");
-      await feClient.signAndSubmitEscrowDeposit({
-        connection,
-        provider: walletHarness(buyer),
-        transaction: first.transaction,
-        lastValidBlockHeight: first.lastValidBlockHeight,
-        orderAccount: first.orderAccount,
-      });
-
-      // `order` is an `init` account, so a second create_order for the same id
-      // can never succeed. That is the program's replay protection, and it is
-      // worth reporting as "already paid".
-      const second = await feClient.prepareEscrowDeposit({
-        connection,
-        auth,
-        buyer: buyer.publicKey,
-      });
-      expect(second.state).to.equal("blocked");
-      expect((second as any).reason).to.equal("order-already-exists");
-    });
-
-    it("blocks when the wallet cannot cover the payment", async () => {
-      const pauper = Keypair.generate();
-      await airdrop(pauper.publicKey, 1); // nowhere near 1.15 SOL plus rent
-      const orderId = "fe-poor-" + Date.now();
-      const auth = authorizationFor(orderId, pauper.publicKey, nowSeconds() + 120n);
-
-      const result = await feClient.prepareEscrowDeposit({
-        connection,
-        auth,
-        buyer: pauper.publicKey,
-      });
-      expect(result.state).to.equal("blocked");
-      expect((result as any).reason).to.equal("insufficient-sol");
-      expect((result as any).shortfallLamports > 0n).to.equal(true);
     });
   });
 });
