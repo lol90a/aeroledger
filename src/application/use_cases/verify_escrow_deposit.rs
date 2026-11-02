@@ -45,7 +45,22 @@ use crate::domain::repositories::payment_repository::PaymentRepository;
 use crate::domain::repositories::quote_repository::QuoteRepository;
 use crate::shared::errors::DomainError;
 
+use crate::domain::value_objects::Chain;
+
 use super::authorize_escrow::EscrowDeployment;
+
+/// One chain's escrow: something to read it with, and what to compare against.
+pub struct ChainEscrow {
+    pub gateway: std::sync::Arc<dyn EscrowGateway>,
+    pub deployment: EscrowDeployment,
+}
+
+/// Whichever escrows this deployment can read. Both may be absent.
+#[derive(Default)]
+pub struct EscrowGateways {
+    pub solana: Option<ChainEscrow>,
+    pub evm: Option<ChainEscrow>,
+}
 
 pub struct VerifyEscrowDepositInput {
     pub booking_id: Uuid,
@@ -71,40 +86,30 @@ pub struct EscrowDepositView {
     pub verified_at: Option<String>,
 }
 
-pub struct VerifyEscrowDeposit<QR, PR, ER, G>
+pub struct VerifyEscrowDeposit<QR, PR, ER>
 where
     QR: QuoteRepository,
     PR: PaymentRepository,
     ER: EscrowOrderRepository,
-    G: EscrowGateway + ?Sized,
 {
     quotes: QR,
     payments: PR,
     escrow_orders: ER,
-    gateway: std::sync::Arc<G>,
-    deployment: EscrowDeployment,
+    escrows: EscrowGateways,
 }
 
-impl<QR, PR, ER, G> VerifyEscrowDeposit<QR, PR, ER, G>
+impl<QR, PR, ER> VerifyEscrowDeposit<QR, PR, ER>
 where
     QR: QuoteRepository,
     PR: PaymentRepository,
     ER: EscrowOrderRepository,
-    G: EscrowGateway + ?Sized,
 {
-    pub fn new(
-        quotes: QR,
-        payments: PR,
-        escrow_orders: ER,
-        gateway: std::sync::Arc<G>,
-        deployment: EscrowDeployment,
-    ) -> Self {
+    pub fn new(quotes: QR, payments: PR, escrow_orders: ER, escrows: EscrowGateways) -> Self {
         Self {
             quotes,
             payments,
             escrow_orders,
-            gateway,
-            deployment,
+            escrows,
         }
     }
 
@@ -124,10 +129,21 @@ where
             return Err(DomainError::Unauthorized);
         }
 
+        // Which escrow settles this booking is decided by the quote the
+        // customer accepted, never by anything the client sends.
+        let escrow = match quote.chain {
+            Chain::Solana => self.escrows.solana.as_ref(),
+            Chain::Ethereum | Chain::Bsc => self.escrows.evm.as_ref(),
+            Chain::Bitcoin => None,
+        }
+        .ok_or_else(|| {
+            DomainError::Conflict("Escrow payment is not available on this network".to_string())
+        })?;
+
         let expected_order_id = quote.id.to_string();
         let split = quote.escrow_split()?;
 
-        let order = self
+        let order = escrow
             .gateway
             .fetch_order(&input.order_account)
             .await?
@@ -139,7 +155,13 @@ where
                 )
             })?;
 
-        self.check_order_matches(&order, &expected_order_id, split.amount, split.fee_amount)?;
+        check_order_matches(
+            &escrow.deployment,
+            &order,
+            &expected_order_id,
+            split.amount,
+            split.fee_amount,
+        )?;
 
         let now = Utc::now();
         let candidate = EscrowOrderRecord {
@@ -148,7 +170,7 @@ where
             quote_id: quote.id,
             order_id: expected_order_id,
             order_account: input.order_account.clone(),
-            program_id: self.deployment.program_id.clone(),
+            program_id: escrow.deployment.program_id.clone(),
             buyer: order.buyer.clone(),
             seller: order.seller.clone(),
             mint: order.mint.clone(),
@@ -202,19 +224,64 @@ where
         })
     }
 
-    /// Every way the presented order can fail to be the one this booking needs.
+    /// Mark the booking's payment confirmed.
     ///
-    /// Each check gets its own message. "Verification failed" tells a customer
-    /// nothing and tells an engineer less; the difference between "you paid the
-    /// wrong amount" and "that order belongs to another booking" is the
-    /// difference between a refund and a security incident.
-    fn check_order_matches(
+    /// The escrow record carries the evidence; `payments` carries the answer to
+    /// "has the customer settled". The funding transaction reference is
+    /// deliberately *not* written to `payments.tx_hash`: that column feeds
+    /// direct-transfer verification and replay detection, and it holds hashes
+    /// this backend checked itself. A client-supplied one belongs with the
+    /// escrow record, which is explicitly a support artefact.
+    async fn mark_payment_settled(
         &self,
-        order: &EscrowOrder,
-        expected_order_id: &str,
-        expected_amount: u128,
-        expected_fee: u128,
+        booking_id: &Uuid,
+        record: &EscrowOrderRecord,
     ) -> Result<(), DomainError> {
+        if !record.is_paid() {
+            return Ok(());
+        }
+
+        let mut payment = match self.payments.find_by_booking_id(booking_id).await {
+            Ok(payment) => payment,
+            // No payment row yet is not a failure of verification. The deposit
+            // is real and recorded either way; the booking's payment row is
+            // created by `init_payment`, and a reconciliation sweep picks this
+            // up once it exists.
+            Err(DomainError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+
+        if payment.status == crate::domain::entities::payment::PaymentStatus::Confirmed {
+            // Already settled. Writing again would be harmless but pointless,
+            // and the no-op is what makes repeated verification cheap.
+            return Ok(());
+        }
+
+        // The entity owns the transition, including the refusal to revive a
+        // payment somebody marked failed.
+        payment.settle_via_escrow(&record.buyer)?;
+        self.payments.update(&payment).await
+    }
+}
+
+/// Every way the presented order can fail to be the one this booking needs.
+///
+/// Free-standing because it is pure, and shared because nothing in it differs
+/// between the two chains -- the addresses are spelled differently and that is
+/// all. One copy means no second copy to drift.
+///
+/// Each check gets its own message. "Verification failed" tells a customer
+/// nothing and tells an engineer less; the difference between "you paid the
+/// wrong amount" and "that order belongs to another booking" is the difference
+/// between a refund and a security incident.
+fn check_order_matches(
+    deployment: &EscrowDeployment,
+    order: &EscrowOrder,
+    expected_order_id: &str,
+    expected_amount: u128,
+    expected_fee: u128,
+) -> Result<(), DomainError> {
+    {
         // The decisive one. The gateway has already proved this order's id
         // hashes to the PDA seed it was found under, so an order id that is not
         // ours means a genuine order for a different booking.
@@ -224,12 +291,12 @@ where
             ));
         }
 
-        if order.seller != self.deployment.seller {
+        if order.seller != deployment.seller {
             return Err(DomainError::ValidationError(
                 "That escrow order names a different seller".to_string(),
             ));
         }
-        if order.mint != self.deployment.mint {
+        if order.mint != deployment.mint {
             return Err(DomainError::ValidationError(
                 "That escrow order is denominated in a different token".to_string(),
             ));
@@ -237,12 +304,12 @@ where
         // Both destinations are snapshotted into the order by the program at
         // creation and cannot be changed afterwards -- so checking them here
         // checks where the money will actually go, not where someone says it will.
-        if order.payout_wallet != self.deployment.payout_wallet {
+        if order.payout_wallet != deployment.payout_wallet {
             return Err(DomainError::ValidationError(
                 "That escrow order would pay a different wallet".to_string(),
             ));
         }
-        if order.treasury != self.deployment.treasury {
+        if order.treasury != deployment.treasury {
             return Err(DomainError::ValidationError(
                 "That escrow order names a different fee destination".to_string(),
             ));
@@ -271,45 +338,6 @@ where
         }
 
         Ok(())
-    }
-
-    /// Mark the booking's payment confirmed.
-    ///
-    /// The escrow record carries the evidence; `payments` carries the answer to
-    /// "has the customer settled". The funding transaction signature is
-    /// deliberately *not* written to `payments.tx_hash`: that column feeds
-    /// direct-transfer verification and replay detection, and it holds hashes
-    /// this backend checked itself. A client-supplied signature belongs with
-    /// the escrow record, which is explicitly a support artefact.
-    async fn mark_payment_settled(
-        &self,
-        booking_id: &Uuid,
-        record: &EscrowOrderRecord,
-    ) -> Result<(), DomainError> {
-        if !record.is_paid() {
-            return Ok(());
-        }
-
-        let mut payment = match self.payments.find_by_booking_id(booking_id).await {
-            Ok(payment) => payment,
-            // No payment row yet is not a failure of verification. The deposit
-            // is real and recorded either way; the booking's payment row is
-            // created by `init_payment`, and a reconciliation sweep will pick
-            // this up once it exists.
-            Err(DomainError::NotFound(_)) => return Ok(()),
-            Err(e) => return Err(e),
-        };
-
-        if payment.status == crate::domain::entities::payment::PaymentStatus::Confirmed {
-            // Already settled. Writing again would be harmless but pointless,
-            // and the no-op is what makes repeated verification cheap.
-            return Ok(());
-        }
-
-        // The entity owns the transition, including the refusal to revive a
-        // payment somebody marked failed.
-        payment.settle_via_escrow(&record.buyer)?;
-        self.payments.update(&payment).await
     }
 }
 
@@ -522,6 +550,17 @@ mod tests {
         }
     }
 
+    /// Wrap a gateway as the Solana side, which is what the test quotes use.
+    fn solana_escrow(gateway: Gateway) -> EscrowGateways {
+        EscrowGateways {
+            solana: Some(ChainEscrow {
+                gateway: Arc::new(gateway),
+                deployment: deployment(),
+            }),
+            evm: None,
+        }
+    }
+
     struct Gateway(Option<EscrowOrder>);
 
     #[async_trait]
@@ -540,7 +579,7 @@ mod tests {
         quote_id: Uuid,
         payments: Payments,
         escrow_orders: EscrowOrders,
-        use_case: VerifyEscrowDeposit<Quotes, Payments, EscrowOrders, Gateway>,
+        use_case: VerifyEscrowDeposit<Quotes, Payments, EscrowOrders>,
     }
 
     /// `mutate` adjusts the otherwise-valid on-chain order, so each test says in
@@ -580,8 +619,7 @@ mod tests {
                 Quotes(Some(quote)),
                 payments,
                 escrow_orders,
-                Arc::new(Gateway(Some(order))),
-                deployment(),
+                solana_escrow(Gateway(Some(order))),
             ),
         }
     }
@@ -596,6 +634,182 @@ mod tests {
                     deposit_signature: Some("sig".to_string()),
                 })
                 .await
+        }
+    }
+
+    /// Which escrow settles a booking comes from the accepted quote, not from
+    /// anything the client sends. These prove the routing, because sending a
+    /// Solana order to an EVM gateway (or the reverse) would compare an order
+    /// against the wrong deployment entirely.
+    mod chain_routing {
+        use super::*;
+
+        const EVM_SELLER: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+        const EVM_PAYOUT: &str = "0x90F79bf6EB2c4f870365E785982E1f101E93b906";
+        const EVM_TREASURY: &str = "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65";
+        const EVM_TOKEN: &str = "0x0000000000000000000000000000000000000000";
+        const EVM_CONTRACT: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+
+        fn evm_deployment() -> EscrowDeployment {
+            EscrowDeployment {
+                program_id: EVM_CONTRACT.to_string(),
+                rpc_url: "https://rpc.example".to_string(),
+                seller: EVM_SELLER.to_string(),
+                payout_wallet: EVM_PAYOUT.to_string(),
+                treasury: EVM_TREASURY.to_string(),
+                mint: EVM_TOKEN.to_string(),
+            }
+        }
+
+        fn evm_quote(user_id: Uuid, booking_id: Uuid) -> PaymentQuote {
+            let now = Utc::now();
+            let pricing =
+                PriceBreakdown::calculate(Money::from_cents(100_000, FiatCurrency::Usd).unwrap())
+                    .unwrap();
+            let mut quote = PaymentQuote::issue(
+                Uuid::new_v4(),
+                booking_id,
+                user_id,
+                "eth",
+                Chain::Ethereum,
+                CryptoToken::Eth,
+                pricing,
+                Decimal::from(2000),
+                "test".to_string(),
+                now,
+                Decimal::from_str("0.5").unwrap(),
+                // Wei, and well beyond what a u64 holds.
+                500_000_000_000_000_000_000,
+                EVM_SELLER.to_string(),
+                now,
+            )
+            .unwrap();
+            quote.status = QuoteStatus::Accepted;
+            quote.accepted_at = Some(now);
+            quote
+        }
+
+        fn evm_order(order_id: &str, amount: u128, fee: u128) -> EscrowOrder {
+            EscrowOrder {
+                buyer: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8".to_string(),
+                seller: EVM_SELLER.to_string(),
+                mint: EVM_TOKEN.to_string(),
+                payout_wallet: EVM_PAYOUT.to_string(),
+                treasury: EVM_TREASURY.to_string(),
+                amount,
+                fee_amount: fee,
+                status: EscrowOrderStatus::Pending,
+                created_at: 1_700_000_000,
+                settlement_deadline: 1_700_003_600,
+                timeout_deadline: 1_700_005_400,
+                quote_expiry: 1_700_000_000,
+                order_id_hash: [0u8; 32],
+                order_id: order_id.to_string(),
+            }
+        }
+
+        /// Both chains configured, so routing is a real choice rather than the
+        /// only option available.
+        fn both_chains(evm_gateway: Gateway) -> EscrowGateways {
+            EscrowGateways {
+                solana: Some(ChainEscrow {
+                    gateway: Arc::new(Gateway(None)),
+                    deployment: deployment(),
+                }),
+                evm: Some(ChainEscrow {
+                    gateway: Arc::new(evm_gateway),
+                    deployment: evm_deployment(),
+                }),
+            }
+        }
+
+        #[tokio::test]
+        async fn an_evm_quote_is_verified_against_the_evm_escrow() {
+            let user_id = Uuid::new_v4();
+            let booking_id = Uuid::new_v4();
+            let quote = evm_quote(user_id, booking_id);
+            let split = quote.escrow_split().unwrap();
+            let order = evm_order(&quote.id.to_string(), split.amount, split.fee_amount);
+
+            let use_case = VerifyEscrowDeposit::new(
+                Quotes(Some(quote)),
+                Payments::default(),
+                EscrowOrders::default(),
+                both_chains(Gateway(Some(order))),
+            );
+
+            let view = use_case
+                .execute(VerifyEscrowDepositInput {
+                    booking_id,
+                    user_id,
+                    order_account: "0xabc".to_string(),
+                    deposit_signature: None,
+                })
+                .await
+                .expect("the EVM gateway should have answered");
+
+            assert!(view.paid);
+            // The amount is wei, so it must have survived as u128 end to end.
+            assert_eq!(view.amount, split.amount.to_string());
+            assert!(split.amount > u128::from(u64::MAX));
+        }
+
+        #[tokio::test]
+        async fn an_evm_quote_is_refused_when_only_solana_is_configured() {
+            // Reaching the Solana gateway with an EVM order would compare it
+            // against the wrong seller and treasury entirely.
+            let user_id = Uuid::new_v4();
+            let booking_id = Uuid::new_v4();
+            let quote = evm_quote(user_id, booking_id);
+
+            let use_case = VerifyEscrowDeposit::new(
+                Quotes(Some(quote)),
+                Payments::default(),
+                EscrowOrders::default(),
+                solana_escrow(Gateway(Some(good_order("anything")))),
+            );
+
+            let err = use_case
+                .execute(VerifyEscrowDepositInput {
+                    booking_id,
+                    user_id,
+                    order_account: "0xabc".to_string(),
+                    deposit_signature: None,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, DomainError::Conflict(_)));
+        }
+
+        #[tokio::test]
+        async fn an_evm_order_naming_the_solana_seller_is_refused() {
+            // The clearest expression of why routing matters: an order that
+            // would verify against the other chain's deployment must not
+            // verify against this one.
+            let user_id = Uuid::new_v4();
+            let booking_id = Uuid::new_v4();
+            let quote = evm_quote(user_id, booking_id);
+            let split = quote.escrow_split().unwrap();
+            let mut order = evm_order(&quote.id.to_string(), split.amount, split.fee_amount);
+            order.seller = SELLER.to_string();
+
+            let use_case = VerifyEscrowDeposit::new(
+                Quotes(Some(quote)),
+                Payments::default(),
+                EscrowOrders::default(),
+                both_chains(Gateway(Some(order))),
+            );
+
+            let err = use_case
+                .execute(VerifyEscrowDepositInput {
+                    booking_id,
+                    user_id,
+                    order_account: "0xabc".to_string(),
+                    deposit_signature: None,
+                })
+                .await
+                .unwrap_err();
+            assert!(format!("{}", err).contains("different seller"));
         }
     }
 
@@ -718,8 +932,7 @@ mod tests {
             Quotes(Some(quote)),
             Payments::default(),
             EscrowOrders::default(),
-            Arc::new(Gateway(None)),
-            deployment(),
+            solana_escrow(Gateway(None)),
         );
         let err = use_case
             .execute(VerifyEscrowDepositInput {
@@ -755,8 +968,7 @@ mod tests {
             Quotes(None),
             Payments::default(),
             EscrowOrders::default(),
-            Arc::new(Gateway(Some(good_order("whatever")))),
-            deployment(),
+            solana_escrow(Gateway(Some(good_order("whatever")))),
         );
         let err = use_case
             .execute(VerifyEscrowDepositInput {

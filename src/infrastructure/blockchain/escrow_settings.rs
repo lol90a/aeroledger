@@ -23,10 +23,7 @@
 use std::env;
 use std::sync::Arc;
 
-use crate::application::use_cases::authorize_escrow::EscrowDeployment;
-use crate::domain::ports::escrow_gateway::EscrowGateway;
 use crate::infrastructure::blockchain::quote_authority::QuoteAuthority;
-use crate::infrastructure::blockchain::solana_escrow_gateway::SolanaEscrowGateway;
 
 /// Wrapped SOL. The escrow holds SPL tokens only, so a SOL payment is a wrapped
 /// SOL payment; see `Frontend/src/app/lib/escrow/wsol.ts` for the browser half.
@@ -205,42 +202,6 @@ impl EscrowSettings {
     /// The public key a client checks against `Config.quote_authority` on-chain.
     pub fn quote_authority_base58(&self) -> String {
         self.quote_authority.authority_base58()
-    }
-}
-
-/// The escrow flow as the HTTP layer sees it: settings, a chain reader, and the
-/// deployment description the use cases take.
-///
-/// Assembled once at startup rather than per request. The gateway owns an HTTP
-/// client with its own connection pool, and rebuilding that for every call to
-/// `/payments/escrow/verify` would open a fresh TLS connection to the RPC each
-/// time a customer refreshes a page.
-#[derive(Clone)]
-pub struct EscrowRuntime {
-    pub settings: EscrowSettings,
-    pub gateway: Arc<dyn EscrowGateway>,
-    pub deployment: EscrowDeployment,
-}
-
-impl EscrowRuntime {
-    pub fn new(settings: EscrowSettings, rpc_url: String) -> Self {
-        let gateway = Arc::new(SolanaEscrowGateway::new(
-            rpc_url.clone(),
-            settings.program_id.clone(),
-        ));
-        let deployment = EscrowDeployment {
-            program_id: settings.program_id.clone(),
-            rpc_url,
-            seller: settings.seller.clone(),
-            payout_wallet: settings.payout_wallet.clone(),
-            treasury: settings.treasury.clone(),
-            mint: settings.mint.clone(),
-        };
-        Self {
-            settings,
-            gateway,
-            deployment,
-        }
     }
 }
 

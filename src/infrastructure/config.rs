@@ -5,6 +5,9 @@ use crate::domain::value_objects::{
     Network,
 };
 use crate::infrastructure::blockchain::escrow_settings::{EscrowConfigError, EscrowSettings};
+use crate::infrastructure::blockchain::evm_escrow_settings::{
+    EvmEscrowConfigError, EvmEscrowSettings,
+};
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -40,6 +43,11 @@ pub struct AppConfig {
     /// place -- [`AppConfig::validate`] -- instead of some aborting during
     /// construction and others at the check.
     escrow_error: Option<EscrowConfigError>,
+    /// Solidity escrow deployment, or `None` when this deployment does not
+    /// offer escrow on an EVM chain. Independent of the Solana one: a
+    /// deployment may offer either, both, or neither.
+    pub evm_escrow: Option<EvmEscrowSettings>,
+    evm_escrow_error: Option<EvmEscrowConfigError>,
 }
 
 impl AppConfig {
@@ -72,6 +80,10 @@ impl AppConfig {
         // must not leave `escrow` populated: an authorization built from
         // half-trusted settings is worse than no escrow at all.
         let (escrow, escrow_error) = match EscrowSettings::from_env() {
+            Ok(settings) => (settings, None),
+            Err(e) => (None, Some(e)),
+        };
+        let (evm_escrow, evm_escrow_error) = match EvmEscrowSettings::from_env() {
             Ok(settings) => (settings, None),
             Err(e) => (None, Some(e)),
         };
@@ -116,6 +128,8 @@ impl AppConfig {
                 .unwrap_or(56),
             escrow,
             escrow_error,
+            evm_escrow,
+            evm_escrow_error,
         }
     }
 
@@ -209,6 +223,9 @@ impl AppConfig {
         if let Some(e) = &self.escrow_error {
             return Err(e.to_string());
         }
+        if let Some(e) = &self.evm_escrow_error {
+            return Err(e.to_string());
+        }
 
         if self.app_env == "production" {
             if self.run_migrations {
@@ -300,6 +317,8 @@ impl AppConfig {
             // in explicitly, so no test silently depends on escrow being wired.
             escrow: None,
             escrow_error: None,
+            evm_escrow: None,
+            evm_escrow_error: None,
         }
     }
 }

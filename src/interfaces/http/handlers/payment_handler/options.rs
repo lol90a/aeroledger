@@ -38,10 +38,14 @@ pub(super) struct PaymentOptionResponse {
     rpc_url: Option<String>,
     /// Whether this route can be settled through the on-chain escrow.
     ///
-    /// Escrow is opt-in per deployment and Solana-only, so the browser cannot
-    /// infer it from the chain alone. Serving it here means the checkout offers
-    /// escrow when it will actually work, rather than offering it always and
-    /// letting the customer discover a 503 after they have decided to use it.
+    /// Opt-in per chain, so a deployment may escrow Solana, an EVM chain, both
+    /// or neither, and the browser cannot infer it from the chain alone.
+    /// Serving it here means the checkout offers escrow when it will actually
+    /// work, rather than offering it always and letting the customer discover a
+    /// 503 after they have decided to use it.
+    ///
+    /// Bitcoin is never escrowed: there is no contract, and offering it would
+    /// be offering a payment method that cannot exist.
     escrow_available: bool,
 }
 
@@ -84,7 +88,11 @@ fn build_payment_options(config: &AppConfig) -> Vec<PaymentOptionResponse> {
             // Only Solana needs this; EVM clients key off chain_id and Bitcoin
             // is settled manually.
             rpc_url: (chain == Chain::Solana).then(|| config.solana_rpc_url.clone()),
-            escrow_available: chain == Chain::Solana && config.escrow.is_some(),
+            escrow_available: match chain {
+                Chain::Solana => config.escrow.is_some(),
+                Chain::Ethereum | Chain::Bsc => config.evm_escrow.is_some(),
+                Chain::Bitcoin => false,
+            },
         })
     })
     .collect()
@@ -157,6 +165,92 @@ mod tests {
     }
 
     #[test]
+    fn an_evm_route_advertises_escrow_only_when_the_evm_contract_is_configured() {
+        let mut cfg = AppConfig::fixture();
+        cfg.wallet_eth = "0xEthWallet".to_string();
+        cfg.wallet_sol = "SoLWaLLet1111111111111111111111111111111111".to_string();
+        cfg.solana_rpc_url = "https://api.devnet.solana.com".to_string();
+
+        // Solana escrow on, EVM escrow off: the ETH route must not advertise it.
+        cfg.escrow = Some(escrow_fixture());
+        let options = build_payment_options(&cfg);
+        assert!(
+            options
+                .iter()
+                .find(|o| o.method == "sol")
+                .unwrap()
+                .escrow_available
+        );
+        assert!(
+            !options
+                .iter()
+                .find(|o| o.method == "eth")
+                .unwrap()
+                .escrow_available
+        );
+
+        // And the other way round.
+        cfg.escrow = None;
+        cfg.evm_escrow = Some(evm_escrow_fixture());
+        let options = build_payment_options(&cfg);
+        assert!(
+            !options
+                .iter()
+                .find(|o| o.method == "sol")
+                .unwrap()
+                .escrow_available
+        );
+        assert!(
+            options
+                .iter()
+                .find(|o| o.method == "eth")
+                .unwrap()
+                .escrow_available
+        );
+    }
+
+    #[test]
+    fn bitcoin_never_advertises_escrow() {
+        // No contract exists on that chain, so there is nothing to offer.
+        let mut cfg = AppConfig::fixture();
+        cfg.wallet_btc = "bc1qexample".to_string();
+        cfg.escrow = Some(escrow_fixture());
+        cfg.evm_escrow = Some(evm_escrow_fixture());
+
+        let options = build_payment_options(&cfg);
+        assert!(
+            !options
+                .iter()
+                .find(|o| o.method == "btc")
+                .unwrap()
+                .escrow_available
+        );
+    }
+
+    fn evm_escrow_fixture(
+    ) -> crate::infrastructure::blockchain::evm_escrow_settings::EvmEscrowSettings {
+        use crate::infrastructure::blockchain::evm_escrow_settings::EvmEscrowSettings;
+        use std::collections::HashMap;
+
+        const ADDR: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+        let map: HashMap<&'static str, String> = HashMap::from([
+            ("ESCROW_EVM_CONTRACT", ADDR.to_string()),
+            ("ESCROW_EVM_CHAIN_ID", "11155111".to_string()),
+            ("ESCROW_EVM_RPC_URL", "https://rpc.example".to_string()),
+            ("ESCROW_EVM_SELLER", ADDR.to_string()),
+            ("ESCROW_EVM_PAYOUT_WALLET", ADDR.to_string()),
+            ("ESCROW_EVM_TREASURY", ADDR.to_string()),
+            (
+                "ESCROW_EVM_QUOTE_SIGNER_KEY",
+                "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318".to_string(),
+            ),
+        ]);
+        EvmEscrowSettings::from_lookup(move |k| map.get(k).cloned())
+            .expect("valid")
+            .expect("configured")
+    }
+
+    #[test]
     fn escrow_is_advertised_on_solana_only_when_it_is_configured() {
         let mut cfg = AppConfig::fixture();
         cfg.wallet_sol = "SoLWaLLet1111111111111111111111111111111111".to_string();
@@ -171,8 +265,8 @@ mod tests {
             .expect("sol route");
         assert!(sol.escrow_available);
 
-        // The escrow program is a Solana program; an EVM route cannot use it
-        // however it is configured.
+        // Only the Solana escrow is configured here, so no other route may
+        // advertise one.
         for other in options.iter().filter(|o| o.method != "sol") {
             assert!(
                 !other.escrow_available,

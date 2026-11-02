@@ -1,7 +1,7 @@
 use areo_ledger::domain::ports::price_oracle::PriceOracle;
 use areo_ledger::infrastructure::auth::jwt_service::JwtService;
 use areo_ledger::infrastructure::blockchain::bitcoin_gateway::BitcoinGateway;
-use areo_ledger::infrastructure::blockchain::escrow_settings::EscrowRuntime;
+use areo_ledger::infrastructure::blockchain::escrow_runtime::EscrowRuntime;
 use areo_ledger::infrastructure::blockchain::evm_gateway::EvmGateway;
 use areo_ledger::infrastructure::blockchain::router_gateway::MultiChainGateway;
 use areo_ledger::infrastructure::blockchain::solana_gateway::SolanaGateway;
@@ -77,22 +77,22 @@ async fn main() -> std::io::Result<()> {
     let app_config = web::Data::new(config.clone());
     let jwt = web::Data::new(JwtService::new(config.jwt_secret.clone()));
 
-    // Escrow is opt-in, and a partial configuration has already been rejected by
-    // `config.validate()` above -- so reaching here with `Some` means every
-    // address parsed and the signing key loaded. Built once: the gateway owns an
-    // HTTP client, and rebuilding it per request would open a new TLS connection
-    // to the RPC on every page refresh.
-    let escrow_runtime = config
-        .escrow
-        .clone()
-        .map(|settings| EscrowRuntime::new(settings, config.solana_rpc_url.clone()));
-    match &escrow_runtime {
-        Some(runtime) => log::info!(
-            "Solana escrow enabled: program {}, quote authority {}",
-            runtime.settings.program_id,
-            runtime.settings.quote_authority_base58()
-        ),
-        None => log::info!("Solana escrow not configured; direct transfer only."),
+    // Escrow is opt-in per chain, and a partial configuration has already been
+    // rejected by `config.validate()` above -- so anything present here parsed
+    // cleanly and its signing key loaded. Built once: each gateway owns an HTTP
+    // client, and rebuilding it per request would open a new TLS connection to
+    // an RPC on every page refresh.
+    let escrow_runtime = EscrowRuntime::new(
+        config.escrow.clone(),
+        config.solana_rpc_url.clone(),
+        config.evm_escrow.clone(),
+    );
+    if escrow_runtime.is_enabled() {
+        for line in escrow_runtime.describe() {
+            log::info!("{}", line);
+        }
+    } else {
+        log::info!("Escrow not configured on any chain; direct transfer only.");
     }
     let escrow_runtime = web::Data::new(escrow_runtime);
 
@@ -139,10 +139,10 @@ async fn main() -> std::io::Result<()> {
     // through this backend. Without a sweep the database would record every
     // order exactly as it looked when it was funded, and a refunded booking
     // would read as paid forever.
-    if let Some(runtime) = escrow_runtime.get_ref() {
+    for gateway in escrow_runtime.all_gateways() {
         EscrowReconciliationWorker::new(
             pool.clone(),
-            runtime.gateway.clone(),
+            gateway,
             config.reconciliation_interval_seconds,
         )
         .spawn();
