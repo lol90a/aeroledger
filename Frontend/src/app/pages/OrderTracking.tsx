@@ -5,10 +5,18 @@ import { useEffect, useMemo, useState } from "react";
 
 import {
   fetchBookingById,
+  fetchLatestBooking,
   normalizeSettlementStatus,
   type LatestBookingResponse,
   type SettlementStatus,
 } from "../lib/backend";
+
+/**
+ * Route parameter meaning "my most recent order" rather than a booking id.
+ * The Tracking nav link has nowhere else to point: a user arriving from the
+ * menu has not chosen a booking yet.
+ */
+const LIVE_ROUTE_ID = "live";
 import { authEventName, getAuthSession, type AuthSession } from "../lib/auth";
 
 type TimelineItem = {
@@ -115,9 +123,17 @@ export default function OrderTracking() {
       }
 
       try {
-        // Fetch the specific booking named in the route. We never fall back to a
-        // different booking's data, which previously showed the wrong order.
-        const result = await fetchBookingById(session.token, id);
+        // `/orders/live` is the nav entry point and means "whatever I ordered
+        // most recently" rather than a booking id. Sending the literal "live"
+        // to /api/bookings/{id} made the server try to parse it as a UUID and
+        // fail, so Tracking was broken for every user who clicked it.
+        //
+        // Any other value is a real id. We never fall back to a different
+        // booking's data, which previously showed the wrong order.
+        const result =
+          id === LIVE_ROUTE_ID
+            ? await fetchLatestBooking(session.token)
+            : await fetchBookingById(session.token, id);
         if (!active) return;
         setBooking(result);
       } catch (err) {
@@ -137,7 +153,13 @@ export default function OrderTracking() {
   }, [session, id]);
 
   const order = useMemo(() => {
-    if (!id || !booking || booking.booking_id !== id) {
+    if (!id || !booking) {
+      return null;
+    }
+    // On `/orders/live` the server chose the booking, so there is no id to
+    // match against. On a specific id, the response must be that booking --
+    // rendering a different one is how the wrong order got shown before.
+    if (id !== LIVE_ROUTE_ID && booking.booking_id !== id) {
       return null;
     }
     return buildFromBooking(booking);
