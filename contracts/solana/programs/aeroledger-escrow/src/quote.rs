@@ -398,3 +398,38 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod golden_vector {
+    use super::*;
+
+    /// Golden vector shared with the backend's `quote_authority` module.
+    ///
+    /// The backend builds this same message in Rust from its own copy of the
+    /// layout. If either side drifts, one of these two tests fails — which is
+    /// the point: a silent divergence would make every signature fail
+    /// on-chain, and the symptom would look like a wrong key rather than a
+    /// wrong message.
+    pub const GOLDEN_HEX: &str = include_str!("quote_golden.txt");
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    #[test]
+    fn canonical_message_matches_the_shared_golden_vector() {
+        let order_id_hash = anchor_lang::solana_program::keccak::hash(b"booking-1").0;
+        let msg = quote_message(
+            &order_id_hash,
+            &Pubkey::new_from_array([7u8; 32]),
+            &Pubkey::new_from_array([8u8; 32]),
+            &Pubkey::new_from_array([9u8; 32]),
+            &QuoteCommitment {
+                amount: 1_833_740_832,
+                fee_amount: 15_000_000,
+                expiry: 1_900_000_000,
+            },
+        );
+        assert_eq!(to_hex(&msg), GOLDEN_HEX.trim());
+    }
+}
