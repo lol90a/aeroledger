@@ -244,10 +244,18 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
     setBusy("accept");
     try {
       // Balances move. Re-read immediately before locking the price rather than
-      // relying on whatever was on screen.
-      if (wallet) {
-        const fresh = await refreshBalance(wallet, quote);
-        if (fresh?.state === "ok" && !fresh.sufficient) {
+      // relying on whatever was on screen, whether the figure came from a
+      // connected wallet or from an address the user typed in.
+      const required = parseBaseUnits(quote.crypto_base_units);
+      const fresh = wallet
+        ? await refreshBalance(wallet, quote)
+        : manualAddress.trim() && required !== null
+          ? await checkAddressBalance(route, manualAddress, required)
+          : null;
+
+      if (fresh?.state === "ok") {
+        setBalance(fresh);
+        if (!fresh.sufficient) {
           throw new Error(
             `Not enough ${option.token}: you need ${formatUnits(fresh.required, option.decimals)} and hold ${formatUnits(fresh.balance, option.decimals)}.`,
           );
