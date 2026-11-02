@@ -301,11 +301,14 @@ where
         };
 
         if payment.status == crate::domain::entities::payment::PaymentStatus::Confirmed {
+            // Already settled. Writing again would be harmless but pointless,
+            // and the no-op is what makes repeated verification cheap.
             return Ok(());
         }
 
-        payment.status = crate::domain::entities::payment::PaymentStatus::Confirmed;
-        payment.sender_address = Some(record.buyer.clone());
+        // The entity owns the transition, including the refusal to revive a
+        // payment somebody marked failed.
+        payment.settle_via_escrow(&record.buyer)?;
         self.payments.update(&payment).await
     }
 }
