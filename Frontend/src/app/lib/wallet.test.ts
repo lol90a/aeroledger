@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatUnits, parseBaseUnits } from "./wallet";
+import { checkAddressBalance, formatUnits, parseBaseUnits, type PaymentRoute } from "./wallet";
 
 /**
  * The money math. Every amount the checkout displays or sends is produced by
@@ -89,5 +89,71 @@ describe("formatUnits and parseBaseUnits round-trip", () => {
     expect(parseBaseUnits(shown)).toBeNull();
     // The base-unit string does.
     expect(parseBaseUnits(original.toString())).toBe(original);
+  });
+});
+
+describe("checkAddressBalance", () => {
+  function route(overrides: Partial<PaymentRoute> = {}): PaymentRoute {
+    return {
+      method: "sol",
+      token: "SOL",
+      chain: "Solana",
+      walletKind: "solana",
+      chainId: null,
+      tokenContract: null,
+      decimals: 9,
+      rpcUrl: "https://api.devnet.solana.com",
+      ...overrides,
+    };
+  }
+
+  const required = 1_000_000_000n;
+
+  it("asks for an address rather than querying an empty one", async () => {
+    const result = await checkAddressBalance(route(), "   ", required);
+    expect(result.state).toBe("error");
+  });
+
+  /**
+   * An EVM balance needs an injected provider. Inventing an RPC endpoint in the
+   * browser is how a reading ends up coming from a different chain than the one
+   * the payment settles on, so this says so instead of guessing.
+   */
+  it("declines EVM routes rather than picking an endpoint itself", async () => {
+    const result = await checkAddressBalance(
+      route({ walletKind: "evm", token: "ETH", chainId: 11155111 }),
+      "0x1111111111111111111111111111111111111111",
+      required,
+    );
+    expect(result.state).toBe("unsupported");
+  });
+
+  it("refuses when the server supplied no RPC endpoint", async () => {
+    const result = await checkAddressBalance(
+      route({ rpcUrl: null }),
+      "56Pd3cz9Hb1MYCEy347rrhWN22hgQDn3x7epTh6fniaC",
+      required,
+    );
+    expect(result.state).toBe("error");
+    if (result.state === "error") expect(result.reason).toMatch(/endpoint/i);
+  });
+
+  it("rejects a malformed address before making a request", async () => {
+    for (const bad of ["not-an-address", "0x1111111111111111111111111111111111111111", "abc"]) {
+      const result = await checkAddressBalance(route(), bad, required);
+      expect(result.state, `"${bad}" should be rejected`).toBe("error");
+    }
+  });
+
+  it("accepts a well-formed base58 address as far as the network call", async () => {
+    // No fetch in this environment, so it fails at the request rather than at
+    // validation — which is the point: the address itself passed.
+    const result = await checkAddressBalance(
+      route({ rpcUrl: "http://127.0.0.1:1/unreachable" }),
+      "56Pd3cz9Hb1MYCEy347rrhWN22hgQDn3x7epTh6fniaC",
+      required,
+    );
+    expect(result.state).toBe("error");
+    if (result.state === "error") expect(result.reason).not.toMatch(/does not look like/i);
   });
 });

@@ -358,6 +358,71 @@ export async function checkBalance(
   }
 }
 
+/**
+ * Balance check for an address the user types in, with no wallet connected.
+ *
+ * {@link checkBalance} needs an injected provider, so it is unavailable to
+ * anyone paying from a hardware wallet, a phone, an exchange or the CLI — which
+ * is most of the ways people actually hold crypto. Those users previously got
+ * no answer to "do I have enough?" at all and found out by sending a
+ * transaction that failed.
+ *
+ * Solana only, and deliberately so: its balance is a plain JSON-RPC call to the
+ * endpoint the server already told us to use. An EVM balance would need an
+ * injected provider or a server-side proxy, and inventing an RPC endpoint in
+ * the browser is exactly the mistake that lets a reading come from a different
+ * chain than the one the payment settles on.
+ */
+export async function checkAddressBalance(
+  route: PaymentRoute,
+  address: string,
+  requiredBaseUnits: bigint,
+): Promise<BalanceCheck> {
+  const trimmed = address.trim();
+  if (!trimmed) {
+    return { state: "error", reason: "Enter the address you will be paying from." };
+  }
+
+  if (route.walletKind !== "solana") {
+    return {
+      state: "unsupported",
+      reason: `A ${route.token} balance can only be read through a connected wallet, and this browser has none.`,
+    };
+  }
+
+  if (!route.rpcUrl) {
+    return {
+      state: "error",
+      reason:
+        "The server did not supply a Solana RPC endpoint for this route, so the balance cannot be read on the same cluster the payment will be verified on.",
+    };
+  }
+
+  // Base58, 32-byte key. Caught here so a typo reads as a typo rather than as
+  // an RPC failure.
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmed)) {
+    return { state: "error", reason: "That does not look like a Solana address." };
+  }
+
+  try {
+    const lamports = await solanaLamports(route.rpcUrl, trimmed);
+    const needed = requiredBaseUnits + SOLANA_FEE_BUFFER_LAMPORTS;
+    const sufficient = lamports >= needed;
+
+    return {
+      state: "ok",
+      balance: lamports,
+      required: requiredBaseUnits,
+      sufficient,
+      shortfall: sufficient ? 0n : needed - lamports,
+      nativeBalance: lamports,
+      gasLooksThin: lamports < SOLANA_FEE_BUFFER_LAMPORTS,
+    };
+  } catch (err) {
+    return { state: "error", reason: errorMessage(err, "Could not read that address's balance.") };
+  }
+}
+
 /** Shorten an address for display: `0x742d…bEb0`. */
 export function shortenAddress(address: string): string {
   if (address.length <= 12) return address;

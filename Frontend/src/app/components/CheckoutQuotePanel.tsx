@@ -35,6 +35,7 @@ import {
   type QuoteResponse,
 } from "../lib/backend";
 import {
+  checkAddressBalance,
   checkBalance,
   connectWallet,
   formatUnits,
@@ -85,7 +86,8 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
   const [wallet, setWallet] = useState<ConnectedWallet | null>(null);
   const [balance, setBalance] = useState<BalanceCheck | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(0);
-  const [busy, setBusy] = useState<"quote" | "accept" | "wallet" | null>(null);
+  const [manualAddress, setManualAddress] = useState("");
+  const [busy, setBusy] = useState<"quote" | "accept" | "wallet" | "balance" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -146,6 +148,30 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
     },
     [route],
   );
+
+  /**
+   * Balance check for an address the user names, with no wallet connected.
+   * Read-only and advisory: what is owed is fixed by the quote, and the backend
+   * still verifies the real transfer before anything is confirmed.
+   */
+  const handleCheckAddressBalance = useCallback(async () => {
+    if (!quote) {
+      setBalance({ state: "error", reason: "Request a price first." });
+      return;
+    }
+    const required = parseBaseUnits(quote.crypto_base_units);
+    if (required === null) {
+      setBalance({ state: "error", reason: "The server returned an unreadable amount." });
+      return;
+    }
+
+    setBusy("balance");
+    try {
+      setBalance(await checkAddressBalance(route, manualAddress, required));
+    } finally {
+      setBusy(null);
+    }
+  }, [quote, route, manualAddress]);
 
   useEffect(() => {
     void refreshBalance(wallet, quote);
@@ -424,10 +450,50 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
             transaction id.
           </p>
         ) : !walletAvailable(route.walletKind) ? (
-          <p className="mt-4 text-sm text-amber-200/90">
-            No {route.walletKind === "evm" ? "EVM" : "Solana"} wallet detected in this browser.
-            You can still pay manually by sending the exact amount to the address below.
-          </p>
+          <div className="mt-4 space-y-4">
+            <p className="text-sm text-amber-200/90">
+              No {route.walletKind === "evm" ? "EVM" : "Solana"} wallet detected in this browser.
+              You can still pay manually by sending the exact amount to the address below.
+            </p>
+
+            {/* Paying from a hardware wallet, a phone, an exchange or the CLI is
+                the normal case, not an edge case. Reading the balance of an
+                address the user names needs no extension — for Solana it is one
+                RPC call to the endpoint the server already chose. */}
+            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+              <label
+                htmlFor="manual-balance-address"
+                className="text-xs uppercase tracking-[0.18em] text-slate-500"
+              >
+                Check a balance before you pay
+              </label>
+              <div className="mt-3 flex flex-col gap-3 sm:flex-row">
+                <input
+                  id="manual-balance-address"
+                  value={manualAddress}
+                  onChange={(event) => setManualAddress(event.target.value)}
+                  spellCheck={false}
+                  placeholder={`Address you will send ${option.token} from`}
+                  className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-sm text-white outline-none focus:border-amber-500/60"
+                />
+                <button
+                  type="button"
+                  onClick={handleCheckAddressBalance}
+                  disabled={busy !== null || !manualAddress.trim()}
+                  className="inline-flex items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.06] px-5 py-3 text-sm font-medium text-white hover:bg-white/[0.1] disabled:opacity-40"
+                >
+                  {busy === "balance" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  Check balance
+                </button>
+              </div>
+              <p className="mt-3 text-xs leading-5 text-slate-600">
+                Read-only. It asks the same cluster the backend verifies against, and never
+                asks you for a key.
+              </p>
+            </div>
+
+            <BalanceSummary balance={balance} token={option.token} decimals={option.decimals} />
+          </div>
         ) : !wallet ? (
           <button
             type="button"
@@ -473,47 +539,7 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
               </div>
             )}
 
-            {balance?.state === "ok" && (
-              <div
-                className={`rounded-2xl border p-4 text-sm ${
-                  balance.sufficient
-                    ? "border-white/10 bg-black/30 text-slate-300"
-                    : "border-rose-500/30 bg-rose-500/10 text-rose-100"
-                }`}
-              >
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Available</span>
-                  <span className="font-mono text-white">
-                    {formatUnits(balance.balance, option.decimals)} {option.token}
-                  </span>
-                </div>
-                <div className="mt-1 flex justify-between">
-                  <span className="text-slate-400">Required</span>
-                  <span className="font-mono text-white">
-                    {formatUnits(balance.required, option.decimals)} {option.token}
-                  </span>
-                </div>
-                {!balance.sufficient && (
-                  <p className="mt-3 font-medium">
-                    Short by {formatUnits(balance.shortfall, option.decimals)} {option.token}{" "}
-                    (including an allowance for network fees). Top up or choose another
-                    network.
-                  </p>
-                )}
-                {balance.sufficient && balance.gasLooksThin && (
-                  <p className="mt-3 text-amber-200">
-                    Your native balance is low; the transaction may fail on fees.
-                  </p>
-                )}
-              </div>
-            )}
-
-            {balance?.state === "error" && (
-              <p className="text-sm text-amber-200/90">{balance.reason}</p>
-            )}
-            {balance?.state === "unsupported" && (
-              <p className="text-sm text-slate-400">{balance.reason}</p>
-            )}
+            <BalanceSummary balance={balance} token={option.token} decimals={option.decimals} />
 
             <p className="text-xs leading-5 text-slate-600">
               This balance check is a convenience only. What you owe is fixed by the quote
@@ -584,6 +610,64 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
             confirmed when the backend has verified the transfer on-chain, not before.
           </p>
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Balance verdict, shared by the connected-wallet path and the typed-address
+ * path so both report the same numbers in the same shape. Renders nothing until
+ * a check has actually run.
+ */
+function BalanceSummary({
+  balance,
+  token,
+  decimals,
+}: {
+  balance: BalanceCheck | null;
+  token: string;
+  decimals: number;
+}) {
+  if (!balance) return null;
+
+  if (balance.state === "error") {
+    return <p className="text-sm text-amber-200/90">{balance.reason}</p>;
+  }
+  if (balance.state === "unsupported") {
+    return <p className="text-sm text-slate-400">{balance.reason}</p>;
+  }
+
+  return (
+    <div
+      className={`rounded-2xl border p-4 text-sm ${
+        balance.sufficient
+          ? "border-white/10 bg-black/30 text-slate-300"
+          : "border-rose-500/30 bg-rose-500/10 text-rose-100"
+      }`}
+    >
+      <div className="flex justify-between">
+        <span className="text-slate-400">Available</span>
+        <span className="font-mono text-white">
+          {formatUnits(balance.balance, decimals)} {token}
+        </span>
+      </div>
+      <div className="mt-1 flex justify-between">
+        <span className="text-slate-400">Required</span>
+        <span className="font-mono text-white">
+          {formatUnits(balance.required, decimals)} {token}
+        </span>
+      </div>
+      {!balance.sufficient && (
+        <p className="mt-3 font-medium">
+          Short by {formatUnits(balance.shortfall, decimals)} {token} (including an allowance
+          for network fees). Top up or choose another network.
+        </p>
+      )}
+      {balance.sufficient && balance.gasLooksThin && (
+        <p className="mt-3 text-amber-200">
+          Your native balance is low; the transaction may fail on fees.
+        </p>
       )}
     </div>
   );
