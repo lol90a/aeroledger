@@ -50,7 +50,13 @@ import {
   type QuoteCommitment,
 } from "./program";
 import { decodeConfig, decodeMerchant, decodeOrder } from "./accounts";
-import { planWsolFunding, TOKEN_ACCOUNT_BYTES, type WsolFundingPlan } from "./wsol";
+import {
+  escrowDepositBudget,
+  ORDER_ACCOUNT_BYTES,
+  planWsolFunding,
+  TOKEN_ACCOUNT_BYTES,
+  type WsolFundingPlan,
+} from "./wsol";
 
 /* ------------------------------------------------------------------ */
 /* The backend's authorization                                        */
@@ -181,6 +187,13 @@ export type EscrowPreflight =
       transactionBytes: number;
       /** Lamports leaving the buyer's native balance, excluding fees. */
       nativeLamportsNeeded: bigint;
+      /**
+       * The part of that which is rent for accounts `create_order` opens and
+       * the buyer does not get back. Surfaced because it is a real cost on top
+       * of the quoted price and a customer comparing the two should be able to
+       * see it.
+       */
+      rentLamports: bigint;
       wsol: WsolFundingPlan;
     };
 
@@ -400,12 +413,19 @@ export async function prepareEscrowDeposit(
     ? { amount: readTokenAmount(buyerAtaAccount.data) }
     : null;
 
-  const [rentExemptLamports, nativeBalance] = await Promise.all([
-    connection
-      .getMinimumBalanceForRentExemption(TOKEN_ACCOUNT_BYTES)
-      .then((n) => BigInt(n)),
-    connection.getBalance(buyer).then((n) => BigInt(n)),
-  ]);
+  // Both rent figures come from the RPC rather than from a constant: the
+  // rent parameters are cluster state, and a hardcoded 2_039_280 is right until
+  // the day it is not.
+  const [tokenAccountRentLamports, orderAccountRentLamports, nativeBalance] =
+    await Promise.all([
+      connection
+        .getMinimumBalanceForRentExemption(TOKEN_ACCOUNT_BYTES)
+        .then((n) => BigInt(n)),
+      connection
+        .getMinimumBalanceForRentExemption(ORDER_ACCOUNT_BYTES)
+        .then((n) => BigInt(n)),
+      connection.getBalance(buyer).then((n) => BigInt(n)),
+    ]);
 
   // Only a wrapped-SOL route needs wrapping. A USDC route would reach this with
   // a token balance that is already in the right form, and the plan collapses to
@@ -422,10 +442,21 @@ export async function prepareEscrowDeposit(
     ata: buyerAta,
     existing: existingBuyerToken,
     required: auth.quote.amount,
-    rentExemptLamports,
+    rentExemptLamports: tokenAccountRentLamports,
   });
 
-  const needed = wsol.nativeLamportsNeeded + FEE_HEADROOM_LAMPORTS;
+  // `create_order` opens the order account and the escrow vault, both with
+  // `payer = buyer`. Budgeting only the wrapped-SOL top-up leaves the customer
+  // several million lamports short, told they can afford it, and failing
+  // on-chain after they have signed.
+  const budget = escrowDepositBudget({
+    topUpLamports: wsol.topUpLamports,
+    createsWsolAccount: wsol.createsAccount,
+    tokenAccountRentLamports,
+    orderAccountRentLamports,
+  });
+
+  const needed = budget.lamports + FEE_HEADROOM_LAMPORTS;
   if (nativeBalance < needed) {
     return blocked(
       "insufficient-sol",
@@ -498,7 +529,8 @@ export async function prepareEscrowDeposit(
     transaction,
     lastValidBlockHeight,
     transactionBytes,
-    nativeLamportsNeeded: wsol.nativeLamportsNeeded,
+    nativeLamportsNeeded: budget.lamports,
+    rentLamports: budget.rentLamports,
     wsol,
   };
 }

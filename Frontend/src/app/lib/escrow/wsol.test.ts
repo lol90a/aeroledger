@@ -8,7 +8,7 @@ import {
 import { describe, expect, it } from "vitest";
 
 import { WRAPPED_SOL_MINT } from "./program";
-import { planWsolFunding } from "./wsol";
+import { escrowDepositBudget, ORDER_ACCOUNT_BYTES, planWsolFunding } from "./wsol";
 
 const BUYER = Keypair.fromSeed(new Uint8Array(32).fill(1)).publicKey;
 const ATA = getAssociatedTokenAddressSync(WRAPPED_SOL_MINT, BUYER);
@@ -148,5 +148,65 @@ describe("planWsolFunding — guards", () => {
         rentExemptLamports: RENT,
       }),
     ).toThrow(/must be positive/);
+  });
+});
+
+/**
+ * Getting this wrong is worse than not checking at all: the customer is told
+ * they can afford the payment, approves it in their wallet, and the transaction
+ * fails on-chain for insufficient lamports. They have then paid a signature fee
+ * to be told what the pre-flight was supposed to tell them for free.
+ */
+describe("escrowDepositBudget", () => {
+  const TOKEN_RENT = 2_039_280n;
+  const ORDER_RENT = 3_033_600n;
+
+  it("counts the rent for both accounts create_order opens", () => {
+    // Neither comes back to the buyer at settlement. Counting only the
+    // wrapped-SOL top-up leaves them about 5 million lamports short.
+    const budget = escrowDepositBudget({
+      topUpLamports: 1_000_000_000n,
+      createsWsolAccount: false,
+      tokenAccountRentLamports: TOKEN_RENT,
+      orderAccountRentLamports: ORDER_RENT,
+    });
+    expect(budget.rentLamports).toBe(TOKEN_RENT + ORDER_RENT);
+    expect(budget.lamports).toBe(1_000_000_000n + TOKEN_RENT + ORDER_RENT);
+  });
+
+  it("also holds rent for a wrapped-SOL account it creates and closes", () => {
+    // Spent and returned inside the same transaction, so it nets to nothing —
+    // but the buyer must hold it while the transaction runs, and a balance
+    // check that ignores it passes someone who cannot pay.
+    const budget = escrowDepositBudget({
+      topUpLamports: 1_000_000_000n,
+      createsWsolAccount: true,
+      tokenAccountRentLamports: TOKEN_RENT,
+      orderAccountRentLamports: ORDER_RENT,
+    });
+    expect(budget.lamports).toBe(1_000_000_000n + TOKEN_RENT + ORDER_RENT + TOKEN_RENT);
+    // It is transient, so it is not reported as a cost the buyer bears.
+    expect(budget.rentLamports).toBe(TOKEN_RENT + ORDER_RENT);
+  });
+
+  it("still charges rent when the buyer already holds enough wrapped SOL", () => {
+    // No top-up needed, but the order account and the vault are still created.
+    const budget = escrowDepositBudget({
+      topUpLamports: 0n,
+      createsWsolAccount: false,
+      tokenAccountRentLamports: TOKEN_RENT,
+      orderAccountRentLamports: ORDER_RENT,
+    });
+    expect(budget.lamports).toBe(TOKEN_RENT + ORDER_RENT);
+  });
+});
+
+describe("ORDER_ACCOUNT_BYTES", () => {
+  it("matches the program's own size calculation", () => {
+    // 8-byte discriminator + Order::INIT_SPACE. The program asserts the same
+    // expression in `account_sizes_match_their_field_layout`, so a field added
+    // on that side fails there and the rent budget here stops being right.
+    expect(ORDER_ACCOUNT_BYTES).toBe(8 + (32 * 5 + 8 + 8 + 1 + 32 + 32 + (4 + 64) + 1));
+    expect(ORDER_ACCOUNT_BYTES).toBe(318);
   });
 });

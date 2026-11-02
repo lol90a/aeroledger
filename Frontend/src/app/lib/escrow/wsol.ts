@@ -144,3 +144,73 @@ export function planWsolFunding(params: WsolFundingParams): WsolFundingPlan {
 
   return { setup, cleanup, nativeLamportsNeeded, topUpLamports, createsAccount };
 }
+
+/**
+ * Bytes the order account occupies: Anchor's 8-byte discriminator plus
+ * `Order::INIT_SPACE`.
+ *
+ * `32 * 5` for buyer, seller, mint, payout wallet and treasury; `8 + 8` for the
+ * amount and fee; `1` for the status; `32` for four timestamps; `32` for the
+ * order-id hash; `4 + 64` for the length-prefixed order id at its maximum; `1`
+ * for the bump. Anchor reserves the string's maximum rather than its actual
+ * length, so this figure does not vary with the order id.
+ *
+ * Mirrors `account_sizes_match_their_field_layout` in the program, which is
+ * where a field added on that side will fail first.
+ */
+export const ORDER_ACCOUNT_BYTES = 8 + (32 * 5 + 8 + 8 + 1 + 32 + 32 + (4 + 64) + 1);
+
+export type DepositBudget = {
+  /** Everything the buyer's native balance must cover, excluding fees. */
+  lamports: bigint;
+  /** Rent for accounts `create_order` creates and does not give back. */
+  rentLamports: bigint;
+};
+
+/**
+ * What the deposit actually costs the buyer's native balance.
+ *
+ * Easy to get wrong by leaving something out, and leaving something out defeats
+ * the point of a pre-flight: the customer is told they can afford it, signs, and
+ * the transaction fails for insufficient lamports anyway.
+ *
+ * Three things are paid for, not one:
+ *
+ *   * the tokens themselves, by way of the wrapped-SOL top-up;
+ *   * rent for the **order account**, which `create_order` opens with
+ *     `payer = buyer`;
+ *   * rent for the **escrow vault**, likewise `init, payer = buyer`.
+ *
+ * Both of those are the buyer's money and neither comes back at settlement --
+ * they are reclaimed by whoever closes those accounts later, which is the
+ * program, not the buyer. The wrapped-SOL account is different: when this
+ * transaction creates it, it also closes it, so its rent is spent and returned
+ * within the same transaction and nets to nothing. It still has to be *held*
+ * while the transaction runs, so it is counted.
+ */
+export function escrowDepositBudget(params: {
+  /** From the wrapped-SOL plan. */
+  topUpLamports: bigint;
+  createsWsolAccount: boolean;
+  /** Rent-exempt minimum for a 165-byte token account, from the RPC. */
+  tokenAccountRentLamports: bigint;
+  /** Rent-exempt minimum for the order account, from the RPC. */
+  orderAccountRentLamports: bigint;
+}): DepositBudget {
+  const {
+    topUpLamports,
+    createsWsolAccount,
+    tokenAccountRentLamports,
+    orderAccountRentLamports,
+  } = params;
+
+  // The vault is a token account of the order PDA, so it costs the same rent as
+  // any other token account.
+  const rentLamports = orderAccountRentLamports + tokenAccountRentLamports;
+  const transient = createsWsolAccount ? tokenAccountRentLamports : 0n;
+
+  return {
+    lamports: topUpLamports + rentLamports + transient,
+    rentLamports,
+  };
+}
