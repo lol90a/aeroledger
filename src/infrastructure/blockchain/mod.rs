@@ -1,6 +1,7 @@
 pub mod bitcoin_gateway;
 pub mod eip712;
 pub mod escrow_settings;
+pub mod evm_escrow_gateway;
 pub mod evm_gateway;
 pub mod evm_quote_authority;
 pub mod quote_authority;

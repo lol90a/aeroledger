@@ -137,6 +137,101 @@ async function main() {
     },
   };
 
+  // A REAL getOrder response, so the backend's hand-written ABI decoder is
+  // checked against bytes this contract actually produced rather than against a
+  // second hand-written encoder that could share the same misunderstanding.
+  //
+  // The order is funded for a small amount from a Hardhat account: the decoder
+  // cares about layout, not magnitude, and the figures above are already pinned
+  // by the digest.
+  const [, buyerSigner] = await hre.ethers.getSigners();
+  const liveOrderId = "decoder-fixture-order";
+  const liveAmount = hre.ethers.parseEther("1.5");
+  const liveFee = hre.ethers.parseEther("0.1956521739130435");
+
+  await escrow.setMerchant(INPUT.seller, deployer.address, true);
+
+  const liveOrderHash = await escrow.computeOrderHash(
+    buyerSigner.address,
+    liveOrderId,
+  );
+  const latest = await hre.ethers.provider.getBlock("latest");
+  const liveExpiry = latest.timestamp + 600;
+  const liveSignature = await quoteSigner.signTypedData(
+    {
+      name: "AeroLedgerEscrow",
+      version: "2",
+      chainId: Number(network.chainId),
+      verifyingContract,
+    },
+    {
+      Quote: [
+        { name: "orderHash", type: "bytes32" },
+        { name: "buyer", type: "address" },
+        { name: "seller", type: "address" },
+        { name: "token", type: "address" },
+        { name: "amount", type: "uint256" },
+        { name: "fee", type: "uint256" },
+        { name: "expiry", type: "uint256" },
+      ],
+    },
+    {
+      orderHash: liveOrderHash,
+      buyer: buyerSigner.address,
+      seller: INPUT.seller,
+      token: INPUT.token,
+      amount: liveAmount,
+      fee: liveFee,
+      expiry: liveExpiry,
+    },
+  );
+
+  await escrow.connect(buyerSigner).createOrder(
+    {
+      orderId: liveOrderId,
+      seller: INPUT.seller,
+      token: INPUT.token,
+      amount: liveAmount,
+      fee: liveFee,
+      expiry: liveExpiry,
+      signature: liveSignature,
+    },
+    { value: liveAmount },
+  );
+
+  // The raw return bytes, exactly as an eth_call gives them.
+  const getOrderData = escrow.interface.encodeFunctionData("getOrder", [
+    liveOrderHash,
+  ]);
+  const getOrderResult = await hre.ethers.provider.call({
+    to: verifyingContract,
+    data: getOrderData,
+  });
+  const decoded = await escrow.getOrder(liveOrderHash);
+
+  vector.getOrder = {
+    note:
+      "Raw eth_call return data for getOrder, produced by this contract. The " +
+      "backend decodes these bytes and must recover the fields below.",
+    selector: getOrderData.slice(0, 10),
+    orderHash: liveOrderHash,
+    returnData: getOrderResult,
+    expected: {
+      buyer: decoded.buyer,
+      seller: decoded.seller,
+      payoutWallet: decoded.payoutWallet,
+      treasury: decoded.treasury,
+      token: decoded.token,
+      amount: decoded.amount.toString(),
+      fee: decoded.fee.toString(),
+      status: Number(decoded.status),
+      createdAt: decoded.createdAt.toString(),
+      settlementDeadline: decoded.settlementDeadline.toString(),
+      timeoutDeadline: decoded.timeoutDeadline.toString(),
+      orderId: decoded.orderId,
+    },
+  };
+
   const out = path.join(__dirname, "..", "test", "eip712_golden.json");
   fs.writeFileSync(out, `${JSON.stringify(vector, null, 2)}\n`, "utf8");
   console.log(`wrote ${out}`);

@@ -33,8 +33,8 @@ pub struct EscrowOrderRecord {
     pub buyer: String,
     pub seller: String,
     pub mint: String,
-    pub amount_base_units: u64,
-    pub fee_base_units: u64,
+    pub amount_base_units: u128,
+    pub fee_base_units: u128,
     /// Last state read from the chain.
     pub chain_status: EscrowOrderStatus,
     /// When this backend verified the funded order. The only thing that may
@@ -48,7 +48,7 @@ pub struct EscrowOrderRecord {
 
 impl EscrowOrderRecord {
     /// What the seller receives when this order settles.
-    pub fn seller_amount(&self) -> u64 {
+    pub fn seller_amount(&self) -> u128 {
         self.amount_base_units.saturating_sub(self.fee_base_units)
     }
 
@@ -89,8 +89,8 @@ mod tests {
             buyer: "Buyer".to_string(),
             seller: "Seller".to_string(),
             mint: "Mint".to_string(),
-            amount_base_units: 1_150_000_000,
-            fee_base_units: 150_000_000,
+            amount_base_units: 1_150_000_000u128,
+            fee_base_units: 150_000_000u128,
             chain_status: status,
             verified_at: verified.then(Utc::now),
             settled_at: None,

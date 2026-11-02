@@ -266,13 +266,11 @@ impl PaymentQuote {
     /// favour is the kind of detail that is invisible per transaction and
     /// indefensible in aggregate.
     pub fn escrow_split(&self) -> Result<EscrowSplit, DomainError> {
-        let amount = u64::try_from(self.crypto_base_units).map_err(|_| {
-            // The program's amount is a u64. A quote above that is not a
-            // rounding question, it is a pricing fault.
-            DomainError::ValidationError(
-                "quoted amount is too large to escrow on this chain".to_string(),
-            )
-        })?;
+        // No chain-specific cap here. Solana's program stores a u64 and the
+        // Solana authorization narrows to it with its own error; an EVM amount
+        // is wei and routinely exceeds u64. The quote should not have to know
+        // which chain is asking.
+        let amount = self.crypto_base_units;
 
         let total_cents = self.pricing.total.cents();
         if total_cents <= 0 {
@@ -290,9 +288,10 @@ impl PaymentQuote {
         // Widened to u128 before multiplying: `amount` can be billions of
         // lamports and `platform_cents` millions, which overflows u64 together
         // long before either is individually unreasonable.
-        let fee_amount = (u128::from(amount) * platform_cents as u128) / total_cents as u128;
-        let fee_amount = u64::try_from(fee_amount)
-            .map_err(|_| DomainError::ValidationError("fee overflow".to_string()))?;
+        let fee_amount = amount
+            .checked_mul(platform_cents as u128)
+            .ok_or_else(|| DomainError::ValidationError("fee overflow".to_string()))?
+            / total_cents as u128;
 
         // The program requires a fee strictly below the amount, because the fee
         // is carved out of it. `base` is always positive for a real booking, so
@@ -312,15 +311,33 @@ impl PaymentQuote {
 /// The two numbers the escrow program needs, in the token's smallest unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EscrowSplit {
-    /// Total escrowed by the buyer.
-    pub amount: u64,
+    /// Total escrowed by the buyer, in the asset's smallest unit.
+    pub amount: u128,
     /// Platform fee, paid out of `amount` to the treasury at settlement.
-    pub fee_amount: u64,
+    pub fee_amount: u128,
+}
+
+impl EscrowSplit {
+    /// Narrow to the `u64` the Solana program stores.
+    ///
+    /// Solana token amounts are `u64` on-chain, so a quote above that cannot be
+    /// escrowed there at all. That is a pricing fault rather than a rounding
+    /// question, and it is caught here where the message can say so.
+    pub fn to_u64(self) -> Result<(u64, u64), DomainError> {
+        let narrow = |value: u128| {
+            u64::try_from(value).map_err(|_| {
+                DomainError::ValidationError(
+                    "quoted amount is too large to escrow on this chain".to_string(),
+                )
+            })
+        };
+        Ok((narrow(self.amount)?, narrow(self.fee_amount)?))
+    }
 }
 
 impl EscrowSplit {
     /// What the seller receives at settlement.
-    pub fn seller_amount(self) -> u64 {
+    pub fn seller_amount(self) -> u128 {
         self.amount - self.fee_amount
     }
 }
@@ -426,9 +443,35 @@ mod tests {
         }
 
         #[test]
-        fn refuses_an_amount_that_does_not_fit_the_programs_u64() {
-            let err = quote_with(100_000, u128::from(u64::MAX) + 1).escrow_split();
-            assert!(matches!(err, Err(DomainError::ValidationError(_))));
+        fn splits_an_amount_too_large_for_solana_without_complaining() {
+            // The split is chain-agnostic. An EVM amount is wei, where twenty
+            // ether is 2 x 10^19 and already exceeds u64; refusing it here
+            // would make the quote entity know which chain is asking.
+            let split = quote_with(100_000, u128::from(u64::MAX) + 1)
+                .escrow_split()
+                .expect("a wide amount is not a pricing fault on every chain");
+            assert_eq!(split.amount, u128::from(u64::MAX) + 1);
+        }
+
+        #[test]
+        fn narrowing_for_solana_refuses_an_amount_its_program_cannot_hold() {
+            // Solana token amounts are u64 on-chain, so this one cannot be
+            // escrowed there at all. Caught at the boundary that cares.
+            let split = quote_with(100_000, u128::from(u64::MAX) + 1)
+                .escrow_split()
+                .unwrap();
+            assert!(matches!(
+                split.to_u64(),
+                Err(DomainError::ValidationError(_))
+            ));
+        }
+
+        #[test]
+        fn narrowing_passes_an_amount_that_fits() {
+            let split = quote_with(100_000, 1_150_000_000).escrow_split().unwrap();
+            let (amount, fee) = split.to_u64().expect("fits in u64");
+            assert_eq!(amount, 1_150_000_000);
+            assert_eq!(fee, 150_000_000);
         }
     }
 

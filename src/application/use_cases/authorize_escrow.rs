@@ -118,6 +118,9 @@ impl<QR: QuoteRepository, S: QuoteSigner + ?Sized> AuthorizeEscrow<QR, S> {
         }
 
         let split = quote.escrow_split()?;
+        // The Solana program stores token amounts as u64, so this is where a
+        // chain-agnostic split meets a chain-specific limit.
+        let (amount, fee_amount) = split.to_u64()?;
 
         let now = chrono::Utc::now().timestamp();
         let expiry = self
@@ -139,8 +142,8 @@ impl<QR: QuoteRepository, S: QuoteSigner + ?Sized> AuthorizeEscrow<QR, S> {
             &self.deployment.seller,
             &self.deployment.mint,
             EscrowQuote {
-                amount: split.amount,
-                fee_amount: split.fee_amount,
+                amount,
+                fee_amount,
                 expiry,
             },
         )?;
@@ -155,8 +158,8 @@ impl<QR: QuoteRepository, S: QuoteSigner + ?Sized> AuthorizeEscrow<QR, S> {
             treasury: self.deployment.treasury.clone(),
             mint: self.deployment.mint.clone(),
             quote_authority: signed.authority,
-            amount: split.amount.to_string(),
-            fee_amount: split.fee_amount.to_string(),
+            amount: amount.to_string(),
+            fee_amount: fee_amount.to_string(),
             expiry,
             signature: base64_encode(&signed.signature),
             quote_id: quote.id,

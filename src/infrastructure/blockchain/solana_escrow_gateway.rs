@@ -160,8 +160,10 @@ impl SolanaEscrowGateway {
             mint,
             payout_wallet,
             treasury,
-            amount,
-            fee_amount,
+            // Widened here: the account stores u64, the domain carries u128 so
+            // that one order type serves both chains.
+            amount: u128::from(amount),
+            fee_amount: u128::from(fee_amount),
             status,
             created_at,
             settlement_deadline,

@@ -46,16 +46,23 @@ pub struct EscrowOrder {
     pub mint: String,
     pub payout_wallet: String,
     pub treasury: String,
-    /// Escrowed amount in the mint's smallest unit.
-    pub amount: u64,
+    /// Escrowed amount in the asset's smallest unit.
+    ///
+    /// `u128`, not `u64`, because this type serves both chains. Solana's
+    /// program stores a `u64` and widens on read; an EVM amount is wei, where
+    /// twenty ether is 2 x 10^19 and a `u64` would silently truncate it.
+    pub amount: u128,
     /// Platform fee carved out of `amount` at completion.
-    pub fee_amount: u64,
+    pub fee_amount: u128,
     pub status: EscrowOrderStatus,
     pub created_at: i64,
     pub settlement_deadline: i64,
     pub timeout_deadline: i64,
     pub quote_expiry: i64,
-    /// keccak256 of `order_id`; the seed the program derives the order PDA from.
+    /// The 32-byte key the chain derives from the order id: keccak256 of the id
+    /// on Solana, where it seeds the order PDA, and
+    /// `keccak256(abi.encode(buyer, orderId))` on EVM, where it is the storage
+    /// slot. Both are a commitment to the same identifier.
     pub order_id_hash: [u8; 32],
     pub order_id: String,
 }

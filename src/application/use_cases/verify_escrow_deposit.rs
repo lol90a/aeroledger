@@ -212,8 +212,8 @@ where
         &self,
         order: &EscrowOrder,
         expected_order_id: &str,
-        expected_amount: u64,
-        expected_fee: u64,
+        expected_amount: u128,
+        expected_fee: u128,
     ) -> Result<(), DomainError> {
         // The decisive one. The gateway has already proved this order's id
         // hashes to the PDA seed it was found under, so an order id that is not
@@ -336,8 +336,8 @@ mod tests {
     // A 1,000 dollar base becomes 1,150 after the 10% markup and 5% service
     // fee, so the platform's share is 150/1150 of whatever is escrowed.
     const BASE_UNITS: u128 = 1_150_000_000;
-    const EXPECTED_AMOUNT: u64 = 1_150_000_000;
-    const EXPECTED_FEE: u64 = 150_000_000;
+    const EXPECTED_AMOUNT: u128 = 1_150_000_000;
+    const EXPECTED_FEE: u128 = 150_000_000;
 
     fn deployment() -> EscrowDeployment {
         EscrowDeployment {
