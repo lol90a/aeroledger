@@ -81,7 +81,7 @@ export type BalanceCheck =
 /* Injected-provider types                                            */
 /* ------------------------------------------------------------------ */
 
-type Eip1193Provider = {
+export type Eip1193Provider = {
   request(args: { method: string; params?: unknown[] | object }): Promise<unknown>;
   on?(event: string, handler: (...args: unknown[]) => void): void;
   removeListener?(event: string, handler: (...args: unknown[]) => void): void;
@@ -134,6 +134,11 @@ export function hasEvmWallet(): boolean {
 
 export function hasSolanaWallet(): boolean {
   return typeof window !== "undefined" && Boolean(window.solana);
+}
+
+/** The injected EIP-1193 provider, when there is one. */
+export function evmProvider(): Eip1193Provider | null {
+  return typeof window === "undefined" ? null : (window.ethereum ?? null);
 }
 
 /** The injected Solana provider, when there is one. */

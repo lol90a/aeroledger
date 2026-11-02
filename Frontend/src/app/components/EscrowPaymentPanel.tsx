@@ -31,7 +31,10 @@ import { AlertTriangle, CheckCircle2, ExternalLink, Loader2, ShieldCheck } from 
 import {
   authorizeEscrow,
   verifyEscrowDeposit,
+  type EscrowAuthorizationResponse,
   type EscrowDepositResponse,
+  type EvmEscrowAuthorization,
+  type SolanaEscrowAuthorization,
 } from "../lib/backend";
 import {
   escrowConnection,
@@ -40,7 +43,17 @@ import {
   type EscrowAuthorization,
   type SigningProvider,
 } from "../lib/escrow/client";
-import { formatUnits, solanaProvider, type ConnectedWallet } from "../lib/wallet";
+import {
+  prepareEvmEscrowDeposit,
+  submitEvmEscrowDeposit,
+  switchToChain,
+} from "../lib/escrow/evmClient";
+import {
+  evmProvider,
+  formatUnits,
+  solanaProvider,
+  type ConnectedWallet,
+} from "../lib/wallet";
 import { PublicKey } from "@solana/web3.js";
 
 type Props = {
@@ -72,10 +85,8 @@ const PROGRESS: Record<string, string> = {
   verifying: "Verifying the deposit on-chain…",
 };
 
-/** Map the backend's snake_case response onto the client's shape. */
-function toAuthorization(
-  response: Awaited<ReturnType<typeof authorizeEscrow>>,
-): EscrowAuthorization {
+/** Map the backend's snake_case Solana response onto the client's shape. */
+function toSolanaAuthorization(response: SolanaEscrowAuthorization): EscrowAuthorization {
   return {
     programId: response.program_id,
     rpcUrl: response.rpc_url,
@@ -103,32 +114,55 @@ export function EscrowPaymentPanel({
 }: Props) {
   const [stage, setStage] = useState<Stage>({ kind: "idle" });
 
+  /**
+   * Pay through whichever escrow the accepted quote names.
+   *
+   * The chain is the backend's answer, not a choice made here: it comes from
+   * the quote the customer approved, and the two branches below exist because
+   * the chains need genuinely different things, not because the UI offers a
+   * choice.
+   */
   const pay = useCallback(async () => {
-    const provider = solanaProvider();
-    if (!provider) {
-      setStage({
-        kind: "failed",
-        message: "No Solana wallet is connected. Install or unlock Phantom and try again.",
-      });
-      return;
-    }
-    if (!provider.signTransaction && !provider.signAndSendTransaction) {
-      setStage({
-        kind: "failed",
-        message: "This wallet cannot sign transactions, so it cannot pay into escrow.",
-      });
-      return;
-    }
-
     try {
       setStage({ kind: "authorizing" });
-      const authorization = toAuthorization(
-        await authorizeEscrow(token, {
-          booking_id: bookingId,
-          buyer_wallet: wallet.address,
-        }),
-      );
+      const authorization: EscrowAuthorizationResponse = await authorizeEscrow(token, {
+        booking_id: bookingId,
+        buyer_wallet: wallet.address,
+      });
 
+      const deposit =
+        authorization.chain === "solana"
+          ? await paySolana(authorization)
+          : await payEvm(authorization);
+
+      onSettled(deposit);
+    } catch (err) {
+      // A wallet rejection is the commonest path through here and is not an
+      // error worth alarming anyone about.
+      const raw = err instanceof Error ? err.message : String(err);
+      const rejected = /user rejected|declined|denied|4001/i.test(raw);
+      setStage({
+        kind: "failed",
+        message: rejected
+          ? "You declined the transaction in your wallet. Nothing was sent."
+          : raw || "The escrow payment could not be completed.",
+      });
+    }
+
+    async function paySolana(
+      response: SolanaEscrowAuthorization,
+    ): Promise<EscrowDepositResponse> {
+      const provider = solanaProvider();
+      if (!provider) {
+        throw new Error(
+          "No Solana wallet is connected. Install or unlock Phantom and try again.",
+        );
+      }
+      if (!provider.signTransaction && !provider.signAndSendTransaction) {
+        throw new Error("This wallet cannot sign transactions, so it cannot pay into escrow.");
+      }
+
+      const authorization = toSolanaAuthorization(response);
       // The endpoint the backend chose, never the wallet's own. A wallet set to
       // mainnet while we verify on devnet is the mismatch that makes a payment
       // impossible to confirm, and the server owns the network for that reason.
@@ -148,8 +182,7 @@ export function EscrowPaymentPanel({
           prepared.reason === "insufficient-sol" && prepared.shortfallLamports !== undefined
             ? ` You need about ${formatUnits(prepared.shortfallLamports, decimals, 4)} more ${tokenSymbol}.`
             : "";
-        setStage({ kind: "failed", message: prepared.message + detail });
-        return;
+        throw new Error(prepared.message + detail);
       }
 
       setStage({ kind: "awaiting-signature" });
@@ -161,27 +194,79 @@ export function EscrowPaymentPanel({
         orderAccount: prepared.orderAccount,
       });
 
-      // Submitted and confirmed. Still not paid: that is the backend's call.
+      return finish(orderAccount, signature);
+    }
+
+    async function payEvm(
+      authorization: EvmEscrowAuthorization,
+    ): Promise<EscrowDepositResponse> {
+      const provider = evmProvider();
+      if (!provider) {
+        throw new Error("No Ethereum wallet is connected. Unlock MetaMask and try again.");
+      }
+
+      setStage({ kind: "checking" });
+      let prepared = await prepareEvmEscrowDeposit({
+        provider,
+        auth: authorization,
+        buyer: wallet.address,
+      });
+
+      // The one blocked reason the customer can fix without leaving the page.
+      // Worth asking, because the alternative is telling them to go and find a
+      // network menu they may never have opened.
+      if (prepared.state === "blocked" && prepared.reason === "wrong-network") {
+        const outcome = await switchToChain(provider, authorization.chain_id);
+        if (outcome === "unknown-chain") {
+          throw new Error(
+            "Your wallet does not know this network yet. Add it in your wallet, then try again.",
+          );
+        }
+        if (outcome === "declined") {
+          throw new Error("The network switch was declined, so nothing was sent.");
+        }
+        prepared = await prepareEvmEscrowDeposit({
+          provider,
+          auth: authorization,
+          buyer: wallet.address,
+        });
+      }
+
+      if (prepared.state === "blocked") {
+        const detail =
+          prepared.reason === "insufficient-balance" && prepared.shortfall !== undefined
+            ? ` You need about ${formatUnits(prepared.shortfall, decimals, 4)} more ${tokenSymbol}.`
+            : "";
+        throw new Error(prepared.message + detail);
+      }
+
+      setStage({ kind: "awaiting-signature" });
+      const { transactionHash, orderHash } = await submitEvmEscrowDeposit({
+        provider,
+        from: wallet.address,
+        prepared,
+      });
+
+      return finish(orderHash, transactionHash);
+    }
+
+    /**
+     * Submitted and confirmed on-chain. Still not paid: only the backend's own
+     * reading of the order decides that, which is why this step exists at all
+     * and why the badge below comes from its answer.
+     */
+    async function finish(
+      orderReference: string,
+      signature: string,
+    ): Promise<EscrowDepositResponse> {
       setStage({ kind: "verifying", signature });
       const deposit = await verifyEscrowDeposit(token, {
         booking_id: bookingId,
-        order_account: orderAccount,
+        order_account: orderReference,
         deposit_signature: signature,
       });
-
       setStage({ kind: "settled", signature, deposit });
-      onSettled(deposit);
-    } catch (err) {
-      // A wallet rejection is the commonest path through here and is not an
-      // error worth alarming anyone about.
-      const raw = err instanceof Error ? err.message : String(err);
-      const rejected = /user rejected|declined|denied/i.test(raw);
-      setStage({
-        kind: "failed",
-        message: rejected
-          ? "You declined the transaction in your wallet. Nothing was sent."
-          : raw || "The escrow payment could not be completed.",
-      });
+      return deposit;
     }
   }, [bookingId, decimals, onSettled, token, tokenSymbol, wallet.address]);
 
@@ -232,7 +317,7 @@ export function EscrowPaymentPanel({
       <div className="flex items-start gap-2 text-sm text-slate-200">
         <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-sky-300" />
         <p>
-          Your payment is held by an on-chain escrow program, not by AeroLedger. It is
+          Your payment is held by an on-chain escrow contract, not by AeroLedger. It is
           released to the operator when the booking completes, and returns to you if it
           does not.
         </p>

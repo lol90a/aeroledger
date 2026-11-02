@@ -232,6 +232,48 @@ async function main() {
     },
   };
 
+  // The exact calldata the browser must produce for createOrder. A single
+  // dynamic struct argument with two dynamic members, which is the fiddliest
+  // encoding in the whole flow: a head of seven slots, two of which are offsets
+  // relative to the START OF THE STRUCT rather than the start of the call.
+  vector.createOrderCalldata = {
+    note:
+      "Encoded by ethers from the contract ABI. The browser's own encoder must " +
+      "produce these exact bytes, or the contract decodes a different quote than " +
+      "the one that was signed.",
+    input: {
+      orderId: liveOrderId,
+      seller: INPUT.seller,
+      token: INPUT.token,
+      amount: liveAmount.toString(),
+      fee: liveFee.toString(),
+      expiry: String(liveExpiry),
+      signature: liveSignature,
+    },
+    native: escrow.interface.encodeFunctionData("createOrder", [
+      {
+        orderId: liveOrderId,
+        seller: INPUT.seller,
+        token: INPUT.token,
+        amount: liveAmount,
+        fee: liveFee,
+        expiry: liveExpiry,
+        signature: liveSignature,
+      },
+    ]),
+    erc20: escrow.interface.encodeFunctionData("createOrderERC20", [
+      {
+        orderId: liveOrderId,
+        seller: INPUT.seller,
+        token: INPUT.token,
+        amount: liveAmount,
+        fee: liveFee,
+        expiry: liveExpiry,
+        signature: liveSignature,
+      },
+    ]),
+  };
+
   const out = path.join(__dirname, "..", "test", "eip712_golden.json");
   fs.writeFileSync(out, `${JSON.stringify(vector, null, 2)}\n`, "utf8");
   console.log(`wrote ${out}`);

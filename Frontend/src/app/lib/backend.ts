@@ -135,6 +135,10 @@ export type AssetCatalogItem = {
   status: string;
 };
 
+import type { EvmEscrowAuthorization } from "./escrow/evmClient";
+
+export type { EvmEscrowAuthorization };
+
 export type PaymentProofUploadResponse = {
   message: string;
   booking_id: string;
@@ -314,15 +318,15 @@ export async function confirmPayment(token: string, payload: { booking_id: strin
 }
 
 /**
- * What `POST /api/payments/escrow/authorize` returns: the figures plus the
- * backend's signature over them.
+ * What `POST /api/payments/escrow/authorize` returns for a Solana quote.
  *
  * Amounts are decimal strings because a base-unit amount can exceed what a JSON
  * number holds exactly, and addresses are base58. Both are parsed once, in
  * `lib/escrow/client.ts`, so nothing else in the app compares a string to an
  * address object.
  */
-export type EscrowAuthorizationResponse = {
+export type SolanaEscrowAuthorization = {
+  chain: "solana";
   program_id: string;
   rpc_url: string;
   order_id: string;
@@ -340,6 +344,18 @@ export type EscrowAuthorizationResponse = {
   quote_id: string;
 };
 
+/**
+ * The authorization, tagged by the chain that will settle it.
+ *
+ * Which chain comes from the quote the customer accepted, not from anything
+ * the browser asks for. The two variants carry different fields on purpose: a
+ * single shape with half its fields null is how a client reads the wrong one
+ * and builds a transaction nobody will accept.
+ */
+export type EscrowAuthorizationResponse =
+  | SolanaEscrowAuthorization
+  | EvmEscrowAuthorization;
+
 export type EscrowDepositResponse = {
   booking_id: string;
   quote_id: string;
@@ -355,8 +371,8 @@ export type EscrowDepositResponse = {
 /**
  * Ask the backend to authorise the accepted price for one on-chain attempt.
  *
- * Short-lived and bound to this wallet: the signature covers the buyer key, so
- * an authorization issued here is useless from any other wallet.
+ * Short-lived and bound to this wallet: the signature covers the buyer address,
+ * so an authorization issued here is useless from any other wallet.
  */
 export async function authorizeEscrow(
   token: string,

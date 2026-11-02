@@ -313,9 +313,12 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
 
   const insufficient = balance?.state === "ok" && !balance.sufficient;
 
-  // Escrow is Solana-only and opt-in per deployment, and it needs a wallet that
-  // can sign -- a typed-in address cannot authorise a token transfer.
-  const escrowAvailable = option.escrow_available && route.walletKind === "solana";
+  // Escrow is opt-in per chain -- the backend says which routes have one -- and
+  // it needs a wallet that can sign. A typed-in address cannot authorise a
+  // transfer, which is why the manual path below exists alongside it.
+  const escrowAvailable =
+    option.escrow_available &&
+    (route.walletKind === "solana" || route.walletKind === "evm");
 
   const canApprove =
     Boolean(quote) &&
@@ -599,13 +602,13 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
             {payment?.crypto_amount ?? quote?.crypto_amount} {option.token}
           </p>
 
-          {/* The escrow route, when this deployment offers it and a Solana
-              wallet is connected. Offered above the manual transfer because it
-              is the better deal for the customer: the funds are held by a
-              program that can only pay the registered operator or refund them,
-              rather than being sent to an address and trusted. The manual path
-              stays below for anyone paying from an exchange or a wallet that
-              cannot sign a transaction. */}
+          {/* The escrow route, when this deployment offers one on this chain
+              and a wallet is connected. Offered above the manual transfer
+              because it is the better deal for the customer: the funds are held
+              by a contract that can only pay the registered operator or refund
+              them, rather than being sent to an address and trusted. The manual
+              path stays below for anyone paying from an exchange or a wallet
+              that cannot sign a transaction. */}
           {escrowAvailable && wallet && bookingId && (
             <div className="mt-5">
               <EscrowPaymentPanel
@@ -621,8 +624,8 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
 
           {escrowAvailable && !wallet && (
             <p className="mt-5 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs text-slate-300">
-              Connect a Solana wallet to pay into escrow, where the funds are held by
-              the program until your booking completes. Otherwise send the transfer
+              Connect a wallet to pay into escrow, where the funds are held by a
+              contract until your booking completes. Otherwise send the transfer
               manually below.
             </p>
           )}

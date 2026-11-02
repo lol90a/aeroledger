@@ -50,15 +50,20 @@ Properties this buys:
 ### Paying into escrow instead
 
 Steps 4 and 5 above hand money to an address we publish and ask the customer to
-trust us with it. A Solana deployment can offer a second route where they do not
-have to: the funds go to an on-chain escrow program that will only release them
-to the registered operator, or return them to the buyer once a timeout passes.
+trust us with it. A deployment can offer a second route where they do not have
+to: the funds go to an on-chain escrow contract that will only release them to
+the registered operator, or return them to the buyer once a timeout passes.
+
+There are two escrows, one per ecosystem, and both are wired: an Anchor program
+on Solana and a Solidity contract on Ethereum or BSC. Which one settles a
+booking comes from the quote the customer accepted, never from anything the
+browser asks for.
 
 | Step | Endpoint | What the server does |
 |---|---|---|
-| 4a. Authorise | `POST /api/payments/escrow/authorize` | Signs the already-accepted price with an Ed25519 key the program has been told to trust. Short-lived, and bound to one buyer wallet. |
-| — | *(browser)* | Wraps the SOL, carries the signature in a native Ed25519 instruction, and calls `create_order` — one transaction, signed by the buyer's wallet. |
-| 5a. Verify | `POST /api/payments/escrow/verify` | Reads the order account back off the chain and decides whether it settles this booking. |
+| 4a. Authorise | `POST /api/payments/escrow/authorize` | Signs the already-accepted price with a key the contract has been told to trust. Short-lived, bound to one buyer wallet, and tagged with the chain that will settle it. |
+| — | *(browser)* | Solana: wraps the SOL, carries the signature in a native Ed25519 instruction, and calls `create_order`. EVM: encodes the signed quote into `createOrder` calldata and hands it to an EIP-1193 wallet. Either way, one transaction signed by the buyer. |
+| 5a. Verify | `POST /api/payments/escrow/verify` | Reads the order back off the chain and decides whether it settles this booking. |
 
 The backend never builds, signs or submits an escrow transaction. It authorises a
 price and checks what happened. Only the buyer's wallet can move the buyer's
@@ -67,10 +72,13 @@ tokens, which is what makes this escrow rather than custody.
 Three things are worth stating explicitly, because each is a question the design
 has to answer and getting any of them wrong is a money bug:
 
-- **The buyer cannot name their own price.** The program requires a signature from
-  `Config.quote_authority` over a canonical message naming the order, the buyer,
-  the seller, the mint and the figures. The private half of that key never leaves
-  the backend process.
+- **The buyer cannot name their own price.** Each contract requires a signature
+  from a key it records — `Config.quote_authority` on Solana, `quoteSigner` on
+  EVM — over a commitment naming the order, the buyer, the seller, the asset and
+  the figures. The private half never leaves the backend process. On EVM that
+  commitment is an EIP-712 digest, so it is also bound to one chain id and one
+  contract address: a signature authorising a testnet payment cannot authorise
+  the same payment on mainnet.
 - **Presenting somebody else's escrow order does not pay your booking.** That is
   the attack verification exists for, and it is not a forged account — it is a
   real, correctly funded order that simply belongs elsewhere. The order's own id
@@ -81,15 +89,20 @@ has to answer and getting any of them wrong is a money bug:
   unwrapping whatever was in it. Only an account the payment transaction creates
   is closed again, to return its rent.
 
-Escrow is opt-in. A deployment that does not configure it offers the direct
-transfer only, and `payment_options` reports `escrow_available: false` so the
-checkout never offers a route that would fail.
+Escrow is opt-in **per chain**: a deployment may escrow Solana, an EVM chain,
+both, or neither. `payment_options` reports `escrow_available` per route, so the
+checkout never offers a route that would fail. Bitcoin never has one — there is
+no contract, and offering it would be offering a payment method that cannot
+exist.
 
 #### Configuring it
 
-All five must be present together; a partial configuration refuses to start,
-because it would issue authorizations the program rejects for reasons no error
-message connects back to a missing variable.
+Each chain is configured independently, and each is all-or-nothing: a partial
+configuration refuses to start, because it would issue authorizations the
+contract rejects for reasons no error message connects back to a missing
+variable.
+
+**Solana** — all five together:
 
 | Variable | What it is |
 |---|---|
@@ -105,9 +118,27 @@ the payout wallet and treasury must each already have an associated token accoun
 for the mint — the program does not create them, deliberately, so that funds can
 never enter escrow for a seller with nowhere to be paid.
 
-`ESCROW_QUOTE_AUTHORITY_SEED` is a hot key. It is rotatable without touching the
-program's admin, which is why the program keeps `quote_authority` separate from
-`admin`. Generate a throwaway one for local work; never reuse a wallet key.
+**Ethereum / BSC** — all seven together:
+
+| Variable | What it is |
+|---|---|
+| `ESCROW_EVM_CONTRACT` | The deployed `AeroLedgerEscrow` address. |
+| `ESCROW_EVM_CHAIN_ID` | Inside the EIP-712 domain, so a wrong value signs for a different network entirely. |
+| `ESCROW_EVM_RPC_URL` | Where the backend reads orders from. |
+| `ESCROW_EVM_SELLER` | The registered merchant. |
+| `ESCROW_EVM_PAYOUT_WALLET` | Snapshotted into each order at creation. |
+| `ESCROW_EVM_TREASURY` | Receives the platform fee. |
+| `ESCROW_EVM_QUOTE_SIGNER_KEY` | **Secret.** `0x`-prefixed 32-byte private key. |
+| `ESCROW_EVM_TOKEN` | Optional; defaults to the zero address, meaning the native coin. |
+| `ESCROW_EVM_BLOCK_TAG` | Optional; defaults to `finalized`. Only lower it for a local chain. |
+
+Reads default to `finalized` on purpose. A re-org can unmake a transaction that
+`latest` already reported, and settling a booking on a block that is later
+orphaned releases a service against a payment that no longer exists.
+
+Both signing keys are hot keys, rotatable without touching either contract's
+admin — which is why both contracts keep the quote signer separate from the
+owner. Generate throwaway ones for local work; never reuse a wallet key.
 
 ---
 
@@ -295,13 +326,15 @@ and any mix of mainnet and test networks.
 
 Stated plainly, because a reader would otherwise reasonably assume otherwise:
 
-- **Direct payment with on-chain verification is the default path, and the only
-  one on EVM chains.** The Solidity escrow is implemented and tested but is still
-  **not wired into the backend** — nothing in `src/` calls it.
-- **The Solana escrow is wired end to end**: the browser builds and signs the
-  `create_order` transaction, and the backend authorises the price and verifies
-  the resulting order against the chain. It is opt-in per deployment and is
-  offered alongside the direct transfer, never instead of it.
+- **Direct payment with on-chain verification is the default path everywhere**,
+  and the only one on Bitcoin.
+- **Both escrows are wired end to end**: the browser builds and signs the
+  transaction, and the backend authorises the price and verifies the resulting
+  order against the chain. Opt-in per chain, and offered alongside the direct
+  transfer, never instead of it.
+- **Neither escrow has been deployed to a public network by the author**, and no
+  testnet funds have been spent. The Solana one is exercised against a local
+  validator on every CI run; the EVM one is exercised against Hardhat.
 - **Phantom signing has not been executed by the author.** The wallet interface
   is implemented and exercised in the Anchor suite through a keypair harness that
   plays the wallet's part, which covers every line on both sides of the wallet
