@@ -6,7 +6,9 @@ use areo_ledger::infrastructure::blockchain::evm_gateway::EvmGateway;
 use areo_ledger::infrastructure::blockchain::router_gateway::MultiChainGateway;
 use areo_ledger::infrastructure::blockchain::solana_gateway::SolanaGateway;
 use areo_ledger::infrastructure::config::AppConfig;
-use areo_ledger::infrastructure::db::{init_pool, run_migrations};
+use areo_ledger::infrastructure::db::{
+    connection_target, init_pool, looks_like_connection_refused, run_migrations,
+};
 use areo_ledger::infrastructure::pricing::market_price_oracle::MarketPriceOracle;
 use areo_ledger::infrastructure::workers::escrow_reconciliation::EscrowReconciliationWorker;
 use areo_ledger::infrastructure::workers::payment_reconciliation::PaymentReconciliationWorker;
@@ -62,7 +64,26 @@ async fn main() -> std::io::Result<()> {
     let pool = init_pool(&config.database_url);
     if config.run_migrations {
         if let Err(e) = run_migrations(&pool).await {
-            log::error!("Migration failed: {}", e);
+            // The first thing that actually opens a connection, so this is
+            // where an unreachable database surfaces -- and the error chain
+            // underneath says "error connecting to server" and an OS code,
+            // naming neither the address it tried nor what to do about it.
+            if looks_like_connection_refused(e.as_ref()) {
+                let target = connection_target(&config.database_url)
+                    .unwrap_or_else(|| "the address in DATABASE_URL".to_string());
+                log::error!(
+                    "Could not reach Postgres at {}: nothing is listening.",
+                    target
+                );
+                log::error!("Start it with:  docker compose up -d postgres");
+                // The commonest cause on a machine with more than one project
+                // checked out: a Postgres IS running, just not this one's.
+                log::error!(
+                    "If another project's Postgres is already running it will be on a different port; check that `docker ps` and DATABASE_URL agree."
+                );
+            } else {
+                log::error!("Migration failed: {}", e);
+            }
             let mut source = e.source();
             while let Some(err) = source {
                 log::error!("Caused by: {}", err);
