@@ -1239,7 +1239,12 @@ describe("aeroledger-escrow", () => {
 
       await program.methods
         .confirmOrder()
-        .accounts({ config: configPda, order, seller: seller.publicKey })
+        .accounts({
+          config: configPda,
+          order,
+          merchant: merchantPda,
+          seller: seller.publicKey,
+        })
         .signers([seller])
         .rpc();
 
@@ -1256,6 +1261,9 @@ describe("aeroledger-escrow", () => {
           payoutWallet: sellerPayout.publicKey,
           treasuryTokenAccount: wsolTreasuryAta,
           treasury: treasury.publicKey,
+          // The vault is closed at settlement and its rent goes back to whoever
+          // paid it, which is the buyer.
+          buyer: buyer.publicKey,
           authority: seller.publicKey,
           mint: NATIVE_MINT,
           tokenProgram: TOKEN_PROGRAM_ID,
