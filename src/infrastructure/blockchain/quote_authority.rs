@@ -25,10 +25,37 @@ const QUOTE_DOMAIN: &[u8] = b"AEROLEDGER_ORDER_QUOTE_V1";
 /// + amount(8) + fee_amount(8) + expiry(8)
 const QUOTE_MESSAGE_LEN: usize = 25 + 32 + 32 + 32 + 32 + 8 + 8 + 8;
 
-/// Longest a signed quote may remain usable on-chain. The program enforces its
-/// own bound; matching it here means we never issue a quote the program will
-/// reject for lifetime.
-pub const MAX_QUOTE_LIFETIME_SECS: i64 = 180;
+/// The program's ceiling on how far ahead a signed quote may expire, from
+/// `MAX_QUOTE_LIFETIME_SECS` in the escrow program. `create_order` rejects
+/// anything beyond it, measured against the slot clock at execution time.
+pub const PROGRAM_MAX_QUOTE_LIFETIME_SECS: i64 = 900;
+
+/// How long *we* choose to make an on-chain authorization valid.
+///
+/// This is a policy decision, not the program's limit, and the two are
+/// different things:
+///
+///   * the **price reservation** (`QUOTE_TTL_SECONDS`, ten minutes) is the
+///     business promise that the amount will not move;
+///   * an **authorization** is a short-lived signature permitting one on-chain
+///     attempt at that already-agreed amount.
+///
+/// Short, because a leaked signature is only useful until it expires. Not too
+/// short, because the buyer has to read a Phantom prompt, approve it, and the
+/// transaction has to reach execution. Three minutes covers a slow human and a
+/// congested cluster while keeping the window small.
+pub const AUTHORIZATION_TTL_SECONDS: i64 = 180;
+
+/// Compile-time invariants, so a careless edit to any of these three numbers
+/// fails the build rather than a test run — or worse, only shows up as
+/// signatures the program rejects at execution.
+const _: () = {
+    // An authorization the program would refuse outright is useless.
+    assert!(AUTHORIZATION_TTL_SECONDS < PROGRAM_MAX_QUOTE_LIFETIME_SECS);
+    // If the TTL were not shorter than the reservation, every authorization
+    // would be clamped to the reservation and the policy would do nothing.
+    assert!(AUTHORIZATION_TTL_SECONDS < crate::domain::entities::quote::QUOTE_TTL_SECONDS);
+};
 
 /// What the backend commits to, and what the program enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +165,38 @@ impl QuoteAuthority {
     /// Base58 public key, as the program stores it in `Config.quote_authority`.
     pub fn authority_base58(&self) -> String {
         bs58::encode(self.verifying_key().to_bytes()).into_string()
+    }
+
+    /// Work out when an authorization issued now should expire.
+    ///
+    /// Two independent bounds, and the earliest wins:
+    ///
+    ///   * our own [`AUTHORIZATION_TTL_SECONDS`], keeping the signature's useful
+    ///     life short;
+    ///   * the price reservation itself. **An authorization must never outlive
+    ///     the reservation it authorises.** If it could, a buyer who let the
+    ///     reservation lapse would still hold a valid signature for the old
+    ///     price, which is silent repricing in the buyer's favour and exactly
+    ///     the hole that makes a short-lived signature pointless.
+    ///
+    /// Returns `None` when the reservation has already expired or has less than
+    /// a second left: there is nothing left to authorise, and the caller must
+    /// re-quote and have the buyer approve the new amount.
+    pub fn authorization_expiry(now: i64, reservation_expires_at: i64) -> Option<i64> {
+        if reservation_expires_at <= now {
+            return None;
+        }
+        let ours = now.saturating_add(AUTHORIZATION_TTL_SECONDS);
+        let expiry = ours.min(reservation_expires_at);
+
+        // Defensive: our TTL is well inside the program's ceiling, but a future
+        // change to either constant must not start issuing quotes the program
+        // will reject outright.
+        debug_assert!(expiry - now <= PROGRAM_MAX_QUOTE_LIFETIME_SECS);
+        if expiry - now > PROGRAM_MAX_QUOTE_LIFETIME_SECS {
+            return Some(now + PROGRAM_MAX_QUOTE_LIFETIME_SECS);
+        }
+        Some(expiry)
     }
 
     /// Sign a price commitment for one specific order, buyer, seller and mint.
@@ -324,6 +383,62 @@ mod tests {
 
     /// Two different orders must never produce the same signed bytes, or a
     /// quote could be reused across bookings.
+    /// A reservation and an authorization are different things with different
+    /// lifetimes, and conflating them is how a buyer ends up holding a valid
+    /// signature for a price that is no longer on offer.
+    mod authorization_expiry {
+        use super::*;
+
+        const NOW: i64 = 1_700_000_000;
+
+        #[test]
+        fn uses_our_short_ttl_while_the_reservation_has_plenty_left() {
+            // Ten minutes of reservation remaining, so our own TTL is the bound.
+            let got = QuoteAuthority::authorization_expiry(NOW, NOW + 600);
+            assert_eq!(got, Some(NOW + AUTHORIZATION_TTL_SECONDS));
+        }
+
+        /// The decisive one. Near the end of a reservation the authorization
+        /// must be cut short, never extended past it.
+        #[test]
+        fn never_outlives_the_reservation_it_authorises() {
+            for remaining in [1, 30, AUTHORIZATION_TTL_SECONDS - 1] {
+                let got = QuoteAuthority::authorization_expiry(NOW, NOW + remaining);
+                assert_eq!(
+                    got,
+                    Some(NOW + remaining),
+                    "with {}s of reservation left the authorization must end with it",
+                    remaining
+                );
+            }
+        }
+
+        #[test]
+        fn refuses_once_the_reservation_has_expired() {
+            assert_eq!(QuoteAuthority::authorization_expiry(NOW, NOW), None);
+            assert_eq!(QuoteAuthority::authorization_expiry(NOW, NOW - 1), None);
+            assert_eq!(QuoteAuthority::authorization_expiry(NOW, 0), None);
+        }
+
+        #[test]
+        fn exactly_at_the_ttl_boundary_the_two_bounds_agree() {
+            let got = QuoteAuthority::authorization_expiry(NOW, NOW + AUTHORIZATION_TTL_SECONDS);
+            assert_eq!(got, Some(NOW + AUTHORIZATION_TTL_SECONDS));
+        }
+
+        /// Whatever the policy, the program rejects anything beyond its own
+        /// ceiling at execution time, so we must never issue one.
+        #[test]
+        fn never_exceeds_the_programs_ceiling() {
+            let got =
+                QuoteAuthority::authorization_expiry(NOW, NOW + 10_000).expect("reservation open");
+            assert!(got - NOW <= PROGRAM_MAX_QUOTE_LIFETIME_SECS);
+        }
+
+        // The relationship between the three lifetimes is asserted at compile
+        // time at the top of this module, which is stronger than a test.
+    }
+
     #[test]
     fn different_orders_produce_different_messages() {
         let a = quote_message("booking-1", &BUYER, &SELLER, &MINT, &commitment());
