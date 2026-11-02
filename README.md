@@ -12,8 +12,8 @@ The interesting part of this system is not the checkout UI — it is the rule th
 amount is computed server-side from an authoritative catalogue price and a recorded
 exchange rate, and every settlement is confirmed by reading the chain. The client
 contributes one identifier and nothing else: a transaction hash on the direct
-path, an account address on the escrow path. Neither is believed, both are looked
-up.
+path, an order reference on the escrow path — an account address on Solana, a
+storage key on EVM. Neither is believed; both are looked up.
 
 ---
 
@@ -89,6 +89,41 @@ has to answer and getting any of them wrong is a money bug:
   unwrapping whatever was in it. Only an account the payment transaction creates
   is closed again, to return its rent.
 
+#### After the deposit
+
+Everything above is driven by the buyer. Nothing after it is. An order is
+confirmed by the seller, completed by the seller or an admin, and refunded by
+the seller, an admin, or the buyer themselves once the timeout passes — none of
+which goes through this backend, because none of it needs to.
+
+So a sweep re-reads open orders and mirrors what it finds. The case that matters
+is a **refund**: the money has gone back to the buyer and the booking is not paid
+for, and without the sweep nothing would ever say so.
+
+Two tables, deliberately, because they answer different questions:
+
+| | answers |
+|---|---|
+| `payments.status` | has the customer settled this booking? |
+| `escrow_orders.chain_status` | where is the money right now? |
+
+A refunded order that still reads as a paid booking is the bug that separation
+prevents. Every column in `escrow_orders` except the local timestamps is a
+mirror of state the chain owns; nothing is written that was not first read back
+from a contract-owned account and checked against the quote it claims to settle.
+
+Settlement windows are split into two, on both chains:
+
+```text
+t <= settlement_deadline   seller settles or refunds; owner/admin too
+t <= timeout_deadline      owner/admin only, arbitrating a late settlement
+t >  timeout_deadline      buyer only, exiting unilaterally
+```
+
+A single deadline left settlement and the buyer's unilateral exit live at the
+same instant, so transaction ordering decided who got the money. Split, at any
+moment either settlement is possible or the exit is, never both.
+
 Escrow is opt-in **per chain**: a deployment may escrow Solana, an EVM chain,
 both, or neither. `payment_options` reports `escrow_available` per route, so the
 checkout never offers a route that would fail. Bitcoin never has one — there is
@@ -152,7 +187,9 @@ and contain no framework types.
 interfaces/      HTTP handlers, middleware, error mapping      (Actix)
      |
 application/     Use cases: create_quote, accept_quote,        (no framework)
-     |           init_payment, confirm_payment, ...
+     |           init_payment, confirm_payment,
+     |           authorize_escrow, verify_escrow_deposit,
+     |           reconcile_escrow_orders
 domain/          Entities, value objects, repository and       (no framework)
      |           gateway traits — the ports
 infrastructure/  Postgres repositories, blockchain gateways,
@@ -181,6 +218,8 @@ Frontend/                   React 18 + TypeScript + Vite
   src/app/pages/            routed pages
   src/app/components/       shared components (ui/ is shadcn/ui)
   src/app/lib/              API client, wallet access, cart, presentation helpers
+  src/app/lib/escrow/       escrow wire format: PDAs and Borsh (Solana),
+                            ABI and EIP-712 calldata (EVM), wrapped SOL
 contracts/solana/           Anchor escrow program + TypeScript integration suite
 contracts/ethereum/         Solidity escrow contract + Hardhat suite
 migrations/                 complete_schema.sql, applied at startup
@@ -234,7 +273,7 @@ migrate`.
 
 ```bash
 cd Frontend
-echo "VITE_API_BASE_URL=http://127.0.0.1:8071" > .env
+echo "VITE_API_BASE_URL=http://127.0.0.1:8081" > .env
 npm install
 npm run dev
 ```
@@ -256,7 +295,7 @@ console.
 Check the stack is up:
 
 ```bash
-curl http://127.0.0.1:8071/api/health
+curl http://127.0.0.1:8081/api/health
 ```
 
 ---
@@ -280,11 +319,6 @@ cd contracts/solana && cargo test --lib
 # Solana integration tests against a local validator
 cd contracts/solana && yarn install --frozen-lockfile && anchor test
 
-# Regenerate the fixture of browser-emitted escrow bytes that the Anchor suite
-# checks against the program's own encoding. Only needed when the escrow wire
-# format changes; the frontend suite fails if the committed copy is stale.
-cd Frontend && npx vite-node scripts/emit-escrow-fixture.ts
-
 # EVM contract tests
 cd contracts/ethereum && npm ci && npx hardhat test
 
@@ -302,6 +336,30 @@ The Solana program id in the repository is the Anchor template placeholder. Befo
 any deploy, generate a real keypair and sync the id — `Anchor.toml` carries the
 exact command, and `anchor keys sync` must not be used (it updates only one of the
 three `[programs.*]` entries per run).
+
+### Golden vectors
+
+Three independent implementations have to agree about the exact bytes a price
+commitment covers: the contract, the backend that signs it, and the browser that
+submits it. A disagreement cannot create money — the contract recomputes the
+commitment and recovers a different signer — but it makes every payment fail
+with an error naming the *key* rather than the *message*, which is a bad
+afternoon.
+
+So each side is checked against a vector generated by the contract itself:
+
+```bash
+# Solana: the browser's create_order bytes, checked by the Anchor suite against
+# Anchor's own encoder.
+cd Frontend && npx vite-node scripts/emit-escrow-fixture.ts
+
+# EVM: the order hash, EIP-712 domain, quote digest, a real getOrder response and
+# the createOrder calldata — checked by the Rust backend and the browser.
+cd contracts/ethereum && npx hardhat run scripts/emit-eip712-golden.js
+```
+
+Only needed when a wire format changes. The committed copies are asserted to be
+current, so a stale one fails a suite rather than rotting quietly.
 
 ---
 
@@ -335,18 +393,24 @@ Stated plainly, because a reader would otherwise reasonably assume otherwise:
 - **Neither escrow has been deployed to a public network by the author**, and no
   testnet funds have been spent. The Solana one is exercised against a local
   validator on every CI run; the EVM one is exercised against Hardhat.
-- **Phantom signing has not been executed by the author.** The wallet interface
-  is implemented and exercised in the Anchor suite through a keypair harness that
-  plays the wallet's part, which covers every line on both sides of the wallet
-  call and nothing of Phantom's own. Running it against the real extension is a
-  manual step; see `anchor test` for what is and is not proven.
+- **No browser wallet has signed one of these, by the author.** Neither Phantom
+  nor MetaMask. Both interfaces are implemented and exercised against scripted
+  providers that play the wallet's part, which covers every line on both sides of
+  the wallet call and nothing of the extension's own. The bytes those calls carry
+  *are* proven: against a real validator for Solana, and byte-for-byte against
+  ethers for EVM. What is unproven is the extension's behaviour and the plumbing
+  around it.
 - **`infrastructure/blockchain/retry.rs`** implements a retrying gateway with a
   circuit breaker. It is tested but not currently constructed in `main.rs`; the
   confirm endpoint is retried by the client instead.
-- **SPL-token settlement on Solana is deliberately unimplemented.** Only native SOL
-  is verified there. A half-right reading of a token transfer is worse than
-  refusing the route.
-- The frontend's tests cover the pure logic that handles money and cart state —
-  base-unit conversion, settlement-status mapping, cart identity. There are no
-  component or end-to-end tests; rendering is covered by type-checking and a
-  production build.
+- **SPL-token settlement is unimplemented on the _direct_ Solana path.**
+  `confirm_payment` verifies native SOL transfers only, because a half-right
+  reading of a token transfer is worse than refusing the route. The escrow path
+  is unaffected and in fact moves wrapped SOL — the contract does the accounting
+  there, and the backend reads the result rather than parsing a transfer.
+- **The frontend's tests cover logic, not rendering.** Base-unit conversion,
+  settlement-status mapping, cart identity, JWT handling, and the whole escrow
+  wire format on both chains — the quote message, account ordering, Borsh and
+  ABI encoding, wrapped-SOL planning, account decoding. There are no component
+  or end-to-end tests; rendering is covered by type-checking and a production
+  build.

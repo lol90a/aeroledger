@@ -155,8 +155,15 @@ async function main() {
     buyerSigner.address,
     liveOrderId,
   );
-  const latest = await hre.ethers.provider.getBlock("latest");
-  const liveExpiry = latest.timestamp + 600;
+  // Pinned, so regenerating produces an identical file. Without this the order
+  // inherits a real block timestamp and every derived value -- createdAt, both
+  // deadlines, the expiry, the signature and all the calldata -- drifts on every
+  // run, which makes the vector churn and hides a meaningful change in noise.
+  //
+  // Comfortably ahead of the deploy block, and the 600-second lifetime is inside
+  // the contract's 15-minute MAX_QUOTE_LIFETIME.
+  const PINNED_TIMESTAMP = 1_900_000_000;
+  const liveExpiry = PINNED_TIMESTAMP + 600;
   const liveSignature = await quoteSigner.signTypedData(
     {
       name: "AeroLedgerEscrow",
@@ -186,6 +193,8 @@ async function main() {
     },
   );
 
+  // Only the next block, so this has to sit immediately before the order.
+  await hre.network.provider.send("evm_setNextBlockTimestamp", [PINNED_TIMESTAMP]);
   await escrow.connect(buyerSigner).createOrder(
     {
       orderId: liveOrderId,
