@@ -10,8 +10,10 @@ on-chain, and only then marks the order settled.
 The interesting part of this system is not the checkout UI — it is the rule that
 **the client never decides what it pays and never decides whether it paid**. Every
 amount is computed server-side from an authoritative catalogue price and a recorded
-exchange rate, and every settlement is confirmed by reading the chain, given nothing
-but a transaction hash.
+exchange rate, and every settlement is confirmed by reading the chain. The client
+contributes one identifier and nothing else: a transaction hash on the direct
+path, an account address on the escrow path. Neither is believed, both are looked
+up.
 
 ---
 
