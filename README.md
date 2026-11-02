@@ -44,6 +44,69 @@ Properties this buys:
   the one the verifier reads. Startup refuses a configuration that mixes mainnet
   and test networks.
 
+
+### Paying into escrow instead
+
+Steps 4 and 5 above hand money to an address we publish and ask the customer to
+trust us with it. A Solana deployment can offer a second route where they do not
+have to: the funds go to an on-chain escrow program that will only release them
+to the registered operator, or return them to the buyer once a timeout passes.
+
+| Step | Endpoint | What the server does |
+|---|---|---|
+| 4a. Authorise | `POST /api/payments/escrow/authorize` | Signs the already-accepted price with an Ed25519 key the program has been told to trust. Short-lived, and bound to one buyer wallet. |
+| — | *(browser)* | Wraps the SOL, carries the signature in a native Ed25519 instruction, and calls `create_order` — one transaction, signed by the buyer's wallet. |
+| 5a. Verify | `POST /api/payments/escrow/verify` | Reads the order account back off the chain and decides whether it settles this booking. |
+
+The backend never builds, signs or submits an escrow transaction. It authorises a
+price and checks what happened. Only the buyer's wallet can move the buyer's
+tokens, which is what makes this escrow rather than custody.
+
+Three things are worth stating explicitly, because each is a question the design
+has to answer and getting any of them wrong is a money bug:
+
+- **The buyer cannot name their own price.** The program requires a signature from
+  `Config.quote_authority` over a canonical message naming the order, the buyer,
+  the seller, the mint and the figures. The private half of that key never leaves
+  the backend process.
+- **Presenting somebody else's escrow order does not pay your booking.** That is
+  the attack verification exists for, and it is not a forged account — it is a
+  real, correctly funded order that simply belongs elsewhere. The order's own id
+  must be the one this booking's quote derives, and every figure and counterparty
+  is compared against the accepted quote.
+- **A wrapped-SOL account the buyer already had is never closed.** Closing a
+  native token account forwards its entire lamport balance to the destination,
+  unwrapping whatever was in it. Only an account the payment transaction creates
+  is closed again, to return its rent.
+
+Escrow is opt-in. A deployment that does not configure it offers the direct
+transfer only, and `payment_options` reports `escrow_available: false` so the
+checkout never offers a route that would fail.
+
+#### Configuring it
+
+All five must be present together; a partial configuration refuses to start,
+because it would issue authorizations the program rejects for reasons no error
+message connects back to a missing variable.
+
+| Variable | What it is |
+|---|---|
+| `ESCROW_PROGRAM_ID` | The deployed escrow program. |
+| `ESCROW_SELLER` | `Merchant.authority` — the seller orders are created against. |
+| `ESCROW_PAYOUT_WALLET` | `Merchant.payout_wallet`, snapshotted into each order. |
+| `ESCROW_TREASURY` | `Config.treasury`, which receives the platform fee. |
+| `ESCROW_QUOTE_AUTHORITY_SEED` | **Secret.** Base58 seed for the signing key. |
+| `ESCROW_MINT` | Optional; defaults to wrapped SOL. |
+
+The seller, payout wallet and treasury must already be registered on-chain, and
+the payout wallet and treasury must each already have an associated token account
+for the mint — the program does not create them, deliberately, so that funds can
+never enter escrow for a seller with nowhere to be paid.
+
+`ESCROW_QUOTE_AUTHORITY_SEED` is a hot key. It is rotatable without touching the
+program's admin, which is why the program keeps `quote_authority` separate from
+`admin`. Generate a throwaway one for local work; never reuse a wallet key.
+
 ---
 
 ## Architecture
@@ -181,8 +244,12 @@ TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/postgres \
 # Solana program unit tests
 cd contracts/solana && cargo test --lib
 
-# Solana integration tests against a local validator
-cd contracts/solana && yarn install --frozen-lockfile && anchor test
+# Solana integration tests against a local validator.
+# The suite's "frontend escrow client" block imports the browser's own modules
+# from Frontend/, so that the code customers run is what gets tested against the
+# validator rather than a mirror of it. Node resolves those imports against
+# Frontend/node_modules, so both installs are needed.
+cd Frontend && npm ci && cd ../contracts/solana && yarn install --frozen-lockfile && anchor test
 
 # EVM contract tests
 cd contracts/ethereum && npm ci && npx hardhat test
@@ -225,9 +292,18 @@ and any mix of mainnet and test networks.
 
 Stated plainly, because a reader would otherwise reasonably assume otherwise:
 
-- **The live payment path is direct payment with on-chain verification.** Both
-  escrow contracts are implemented and tested, but they are **not wired into the
-  backend** — nothing in `src/` calls them yet.
+- **Direct payment with on-chain verification is the default path, and the only
+  one on EVM chains.** The Solidity escrow is implemented and tested but is still
+  **not wired into the backend** — nothing in `src/` calls it.
+- **The Solana escrow is wired end to end**: the browser builds and signs the
+  `create_order` transaction, and the backend authorises the price and verifies
+  the resulting order against the chain. It is opt-in per deployment and is
+  offered alongside the direct transfer, never instead of it.
+- **Phantom signing has not been executed by the author.** The wallet interface
+  is implemented and exercised in the Anchor suite through a keypair harness that
+  plays the wallet's part, which covers every line on both sides of the wallet
+  call and nothing of Phantom's own. Running it against the real extension is a
+  manual step; see `anchor test` for what is and is not proven.
 - **`infrastructure/blockchain/retry.rs`** implements a retrying gateway with a
   circuit breaker. It is tested but not currently constructed in `main.rs`; the
   confirm endpoint is retried by the client instead.
