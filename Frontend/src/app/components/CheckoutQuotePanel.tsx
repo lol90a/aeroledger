@@ -26,11 +26,13 @@ import {
   Wallet,
 } from "lucide-react";
 
+import { EscrowPaymentPanel } from "./EscrowPaymentPanel";
 import {
   acceptQuote,
   createQuote,
   initPayment,
   type InitPaymentResponse,
+  type EscrowDepositResponse,
   type PaymentOption,
   type QuoteResponse,
 } from "../lib/backend";
@@ -90,6 +92,7 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
   const [busy, setBusy] = useState<"quote" | "accept" | "wallet" | "balance" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [escrowDeposit, setEscrowDeposit] = useState<EscrowDepositResponse | null>(null);
 
   const expired = Boolean(quote) && secondsLeft <= 0 && quote?.status === "active";
   const locked = quote?.status === "accepted";
@@ -309,6 +312,10 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
     wallet.chainId !== route.chainId;
 
   const insufficient = balance?.state === "ok" && !balance.sufficient;
+
+  // Escrow is Solana-only and opt-in per deployment, and it needs a wallet that
+  // can sign -- a typed-in address cannot authorise a token transfer.
+  const escrowAvailable = option.escrow_available && route.walletKind === "solana";
 
   const canApprove =
     Boolean(quote) &&
@@ -591,8 +598,43 @@ export function CheckoutQuotePanel({ token, bookingId, option, onReady, onEnsure
           <p className="mt-4 text-2xl font-bold text-white">
             {payment?.crypto_amount ?? quote?.crypto_amount} {option.token}
           </p>
+
+          {/* The escrow route, when this deployment offers it and a Solana
+              wallet is connected. Offered above the manual transfer because it
+              is the better deal for the customer: the funds are held by a
+              program that can only pay the registered operator or refund them,
+              rather than being sent to an address and trusted. The manual path
+              stays below for anyone paying from an exchange or a wallet that
+              cannot sign a transaction. */}
+          {escrowAvailable && wallet && bookingId && (
+            <div className="mt-5">
+              <EscrowPaymentPanel
+                token={token}
+                bookingId={bookingId}
+                wallet={wallet}
+                decimals={option.decimals}
+                tokenSymbol={option.token}
+                onSettled={setEscrowDeposit}
+              />
+            </div>
+          )}
+
+          {escrowAvailable && !wallet && (
+            <p className="mt-5 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs text-slate-300">
+              Connect a Solana wallet to pay into escrow, where the funds are held by
+              the program until your booking completes. Otherwise send the transfer
+              manually below.
+            </p>
+          )}
+
+          {escrowDeposit && (
+            <p className="mt-4 text-xs text-emerald-200">
+              Escrow order recorded. No manual transfer is needed.
+            </p>
+          )}
           <p className="mt-3 text-xs uppercase tracking-[0.24em] text-slate-500">
-            To this address on {option.chain}
+            {escrowAvailable && wallet ? "Or send manually to this address on " : "To this address on "}
+            {option.chain}
             {option.network ? ` (${option.network})` : ""}
           </p>
           <p className="mt-2 break-all font-mono text-sm text-slate-300">

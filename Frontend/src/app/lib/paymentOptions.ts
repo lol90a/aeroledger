@@ -30,6 +30,7 @@ export const FALLBACK_PAYMENT_OPTIONS: [PaymentOption, ...PaymentOption[]] = [
     decimals: 8,
     network: null,
     rpc_url: null,
+    escrow_available: false,
   },
   {
     method: "eth",
@@ -44,6 +45,7 @@ export const FALLBACK_PAYMENT_OPTIONS: [PaymentOption, ...PaymentOption[]] = [
     decimals: 18,
     network: null,
     rpc_url: null,
+    escrow_available: false,
   },
   {
     method: "usdt",
@@ -58,6 +60,7 @@ export const FALLBACK_PAYMENT_OPTIONS: [PaymentOption, ...PaymentOption[]] = [
     decimals: 6,
     network: null,
     rpc_url: null,
+    escrow_available: false,
   },
   {
     method: "usdc",
@@ -72,6 +75,7 @@ export const FALLBACK_PAYMENT_OPTIONS: [PaymentOption, ...PaymentOption[]] = [
     decimals: 6,
     network: null,
     rpc_url: null,
+    escrow_available: false,
   },
   {
     method: "bsc",
@@ -86,6 +90,7 @@ export const FALLBACK_PAYMENT_OPTIONS: [PaymentOption, ...PaymentOption[]] = [
     decimals: 18,
     network: null,
     rpc_url: null,
+    escrow_available: false,
   },
   {
     method: "sol",
@@ -100,6 +105,7 @@ export const FALLBACK_PAYMENT_OPTIONS: [PaymentOption, ...PaymentOption[]] = [
     decimals: 9,
     network: null,
     rpc_url: null,
+    escrow_available: false,
   },
 ];
 

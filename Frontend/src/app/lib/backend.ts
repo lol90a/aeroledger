@@ -22,7 +22,14 @@ export type PaymentOption = {
    * reason as `chain_id`: the browser reading balances on a different cluster
    * than the backend verifies on is a payment that can never confirm.
    */
-  rpc_url: string | null;
+  rpc_url: string | null;  /**
+   * Whether this route can be settled through the on-chain escrow.
+   *
+   * Escrow is opt-in per deployment and Solana-only, so the checkout cannot
+   * infer it from the chain. Offering it when it is not configured would mean
+   * the customer picks it and then meets a 503.
+   */
+  escrow_available: boolean;
 };
 
 export type CreateBookingResponse = {
@@ -300,6 +307,81 @@ export async function initPayment(token: string, payload: { booking_id: string }
 
 export async function confirmPayment(token: string, payload: { booking_id: string; tx_hash: string }) {
   return apiRequest<{ message: string }>("/api/payments/confirm", {
+    method: "POST",
+    token,
+    body: payload,
+  });
+}
+
+/**
+ * What `POST /api/payments/escrow/authorize` returns: the figures plus the
+ * backend's signature over them.
+ *
+ * Amounts are decimal strings because a base-unit amount can exceed what a JSON
+ * number holds exactly, and addresses are base58. Both are parsed once, in
+ * `lib/escrow/client.ts`, so nothing else in the app compares a string to an
+ * address object.
+ */
+export type EscrowAuthorizationResponse = {
+  program_id: string;
+  rpc_url: string;
+  order_id: string;
+  buyer: string;
+  seller: string;
+  payout_wallet: string;
+  treasury: string;
+  mint: string;
+  quote_authority: string;
+  amount: string;
+  fee_amount: string;
+  expiry: number;
+  /** Base64, 64 bytes decoded. */
+  signature: string;
+  quote_id: string;
+};
+
+export type EscrowDepositResponse = {
+  booking_id: string;
+  quote_id: string;
+  order_account: string;
+  status: "pending" | "confirmed" | "completed" | "refunded";
+  amount: string;
+  fee_amount: string;
+  seller_amount: string;
+  paid: boolean;
+  verified_at: string | null;
+};
+
+/**
+ * Ask the backend to authorise the accepted price for one on-chain attempt.
+ *
+ * Short-lived and bound to this wallet: the signature covers the buyer key, so
+ * an authorization issued here is useless from any other wallet.
+ */
+export async function authorizeEscrow(
+  token: string,
+  payload: { booking_id: string; buyer_wallet: string },
+) {
+  return apiRequest<EscrowAuthorizationResponse>("/api/payments/escrow/authorize", {
+    method: "POST",
+    token,
+    body: payload,
+  });
+}
+
+/**
+ * Have the backend read the escrow order back off the chain and decide whether
+ * it settles the booking.
+ *
+ * `order_account` is the only thing the client contributes, and naming the
+ * wrong one cannot settle anything: the backend checks the order's own id
+ * against the quote before it looks at the money.
+ */
+export async function verifyEscrowDeposit(
+  token: string,
+  payload: { booking_id: string; order_account: string; deposit_signature?: string },
+) {
+  return apiRequest<EscrowDepositResponse>("/api/payments/escrow/verify", {
     method: "POST",
     token,
     body: payload,

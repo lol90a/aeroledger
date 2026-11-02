@@ -87,11 +87,26 @@ type Eip1193Provider = {
   removeListener?(event: string, handler: (...args: unknown[]) => void): void;
 };
 
-type SolanaProvider = {
+/**
+ * The injected Solana provider, as Phantom, Solflare and Backpack all expose it.
+ *
+ * The signing methods are optional because not every injected provider offers
+ * both, and a wallet that offers neither is a real case the escrow flow has to
+ * report rather than crash on. `signTransaction` is preferred where it exists:
+ * it leaves submission -- and therefore the choice of RPC endpoint -- with us,
+ * rather than with whatever cluster the wallet's UI happens to be set to.
+ *
+ * Typed loosely as `unknown` on the transaction so this module stays free of a
+ * web3.js import; `lib/escrow/client.ts` owns that dependency and narrows the
+ * provider to the shape it needs.
+ */
+export type SolanaProvider = {
   isPhantom?: boolean;
   publicKey?: { toString(): string } | null;
   connect(opts?: { onlyIfTrusted?: boolean }): Promise<{ publicKey: { toString(): string } }>;
   disconnect?(): Promise<void>;
+  signTransaction?(transaction: never): Promise<never>;
+  signAndSendTransaction?(transaction: never): Promise<{ signature: string }>;
   on?(event: string, handler: (...args: unknown[]) => void): void;
   removeListener?(event: string, handler: (...args: unknown[]) => void): void;
 };
@@ -119,6 +134,11 @@ export function hasEvmWallet(): boolean {
 
 export function hasSolanaWallet(): boolean {
   return typeof window !== "undefined" && Boolean(window.solana);
+}
+
+/** The injected Solana provider, when there is one. */
+export function solanaProvider(): SolanaProvider | null {
+  return typeof window === "undefined" ? null : (window.solana ?? null);
 }
 
 export function walletAvailable(kind: WalletKind): boolean {
