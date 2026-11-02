@@ -16,6 +16,16 @@
 //! This observes and records. It never settles, refunds or completes anything
 //! on-chain — the backend holds no key that could, which is the point of the
 //! design rather than a limitation of this module.
+//!
+//! ## One sweep per chain
+//!
+//! A deployment may run escrows on both Solana and an EVM chain, and each gets
+//! its own sweep. Each only touches orders belonging to its own contract: an
+//! order hash is a `0x` string on EVM and a base58 address on Solana, so a
+//! cross-chain read is not a subtle mistake, it is an immediate decode failure.
+//! Filtering keeps the logs quiet and, more to the point, keeps `failed` in the
+//! summary meaning something — if every sweep counted the other chain's orders
+//! as unreadable, a genuinely unreachable RPC would look like business as usual.
 
 use chrono::Utc;
 
@@ -63,7 +73,15 @@ where
     }
 
     pub async fn execute(&self) -> Result<ReconcileSummary, DomainError> {
-        let open = self.escrow_orders.find_open().await?;
+        let program_id = self.gateway.program_id();
+        let open: Vec<_> = self
+            .escrow_orders
+            .find_open()
+            .await?
+            .into_iter()
+            .filter(|record| record.program_id == program_id)
+            .collect();
+
         let mut summary = ReconcileSummary {
             checked: open.len(),
             ..Default::default()
@@ -590,6 +608,51 @@ mod tests {
                 .1,
             EscrowOrderStatus::Refunded
         );
+    }
+
+    /// A deployment may run both escrows, and each sweep sees every open row.
+    /// Reading an EVM order hash through the Solana gateway is not a subtle
+    /// mistake -- base58 decoding fails immediately -- but it would count as a
+    /// failure every cycle, and a summary where `failed` is always non-zero is
+    /// a summary nobody reads.
+    #[tokio::test]
+    async fn a_sweep_ignores_orders_belonging_to_the_other_chain() {
+        let ours = record(Uuid::new_v4(), "order-ours", EscrowOrderStatus::Confirmed);
+        let mut theirs = record(Uuid::new_v4(), "order-theirs", EscrowOrderStatus::Confirmed);
+        theirs.program_id = "0xSomeOtherContract".to_string();
+
+        let escrow_orders = EscrowOrders::default();
+        escrow_orders.rows.lock().unwrap().push(ours.clone());
+        escrow_orders.rows.lock().unwrap().push(theirs.clone());
+
+        // The gateway answers for either account, so only the filter can stop
+        // the other chain's order being reconciled.
+        let mut orders = HashMap::new();
+        orders.insert(
+            ours.order_account.clone(),
+            Some(on_chain("order-ours", EscrowOrderStatus::Refunded)),
+        );
+        orders.insert(
+            theirs.order_account.clone(),
+            Some(on_chain("order-theirs", EscrowOrderStatus::Refunded)),
+        );
+
+        let use_case = ReconcileEscrowOrders::new(
+            escrow_orders.clone(),
+            Payments::default(),
+            Arc::new(Gateway {
+                orders,
+                fail: Vec::new(),
+            }),
+        );
+
+        let summary = use_case.execute().await.unwrap();
+        assert_eq!(summary.checked, 1, "only this chain's orders are swept");
+        assert_eq!(summary.failed, 0);
+
+        let written = escrow_orders.status_writes.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].0, "order-ours");
     }
 
     #[tokio::test]
