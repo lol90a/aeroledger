@@ -4,6 +4,7 @@ use crate::domain::value_objects::{
     bitcoin_network, check_realm_consistency, evm_network, solana_network, Chain, ConfiguredChain,
     Network,
 };
+use crate::infrastructure::blockchain::escrow_settings::{EscrowConfigError, EscrowSettings};
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -31,6 +32,14 @@ pub struct AppConfig {
     pub ethereum_chain_id: u64,
     /// EIP-155 chain id for the BSC gateway. 56 = BSC mainnet, 97 = testnet.
     pub bsc_chain_id: u64,
+    /// Solana escrow deployment, or `None` when this deployment does not offer
+    /// escrow and settles by direct transfer only.
+    pub escrow: Option<EscrowSettings>,
+    /// Set when escrow variables were present but rejected. Held rather than
+    /// acted on here so that every configuration problem is reported from one
+    /// place -- [`AppConfig::validate`] -- instead of some aborting during
+    /// construction and others at the check.
+    escrow_error: Option<EscrowConfigError>,
 }
 
 impl AppConfig {
@@ -58,6 +67,14 @@ impl AppConfig {
                 }
             })
             .to_ascii_lowercase();
+
+        // Split now, reported by `validate`. A rejected escrow configuration
+        // must not leave `escrow` populated: an authorization built from
+        // half-trusted settings is worse than no escrow at all.
+        let (escrow, escrow_error) = match EscrowSettings::from_env() {
+            Ok(settings) => (settings, None),
+            Err(e) => (None, Some(e)),
+        };
 
         Self {
             database_url: env::var("DATABASE_URL").unwrap_or_default(),
@@ -97,6 +114,8 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(56),
+            escrow,
+            escrow_error,
         }
     }
 
@@ -184,6 +203,13 @@ impl AppConfig {
         // that verifies on mainnet while the wallet is told to use devnet.
         check_realm_consistency(&self.configured_chains())?;
 
+        // Escrow is opt-in, but a partially configured one is refused outright:
+        // it would issue price authorizations that the program rejects for
+        // reasons no error message connects back to a missing variable.
+        if let Some(e) = &self.escrow_error {
+            return Err(e.to_string());
+        }
+
         if self.app_env == "production" {
             if self.run_migrations {
                 return Err("RUN_MIGRATIONS must be disabled in production; run migrations as a deployment step".to_string());
@@ -270,6 +296,10 @@ impl AppConfig {
             reconciliation_interval_seconds: 60,
             ethereum_chain_id: 1,
             bsc_chain_id: 56,
+            // Escrow off by default in the fixture: a test that needs it opts
+            // in explicitly, so no test silently depends on escrow being wired.
+            escrow: None,
+            escrow_error: None,
         }
     }
 }

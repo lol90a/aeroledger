@@ -474,3 +474,58 @@ WHERE token_decimals = 18 AND token IN ('BTC','SOL','USDT','USDC');
 UPDATE payments
 SET crypto_base_units = TRUNC(amount * POWER(10::NUMERIC, token_decimals))::NUMERIC(40,0)
 WHERE crypto_base_units = 0 AND amount > 0;
+
+-- ── Escrow orders (Solana) ────────────────────────────────────────────────────
+-- An escrow order is a distinct on-chain entity with its own lifecycle, so it
+-- gets its own table rather than more columns on `payments`. The two answer
+-- different questions: `payments.status` is "has the customer paid for this
+-- booking", `escrow_orders.chain_status` is "where are the funds right now".
+-- Conflating them is how a refunded order ends up still reading as paid.
+--
+-- Every column here except the local timestamps is a MIRROR of state the chain
+-- owns. Nothing is written to this table that was not first read back from a
+-- program-owned account and checked against the quote it is supposed to settle.
+CREATE TABLE IF NOT EXISTS escrow_orders (
+    id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    booking_id        UUID NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+    quote_id          UUID NOT NULL REFERENCES payment_quotes(id) ON DELETE CASCADE,
+
+    -- The string hashed into the PDA seed. Unique because the program derives
+    -- one address from it and `init` makes a second order at that address
+    -- impossible; the constraint keeps our mirror honest about that.
+    order_id          TEXT NOT NULL UNIQUE,
+    -- The order PDA itself.
+    order_account     TEXT NOT NULL UNIQUE,
+    program_id        TEXT NOT NULL,
+
+    buyer             TEXT NOT NULL,
+    seller            TEXT NOT NULL,
+    mint              TEXT NOT NULL,
+    -- Integer base units, as read from the account. Never a float, never USD.
+    amount_base_units NUMERIC(40,0) NOT NULL CHECK (amount_base_units > 0),
+    fee_base_units    NUMERIC(40,0) NOT NULL CHECK (fee_base_units >= 0),
+    CONSTRAINT escrow_fee_below_amount CHECK (fee_base_units < amount_base_units),
+
+    -- Mirrors the program's OrderStatus. Constrained so a typo in application
+    -- code cannot invent a state the program has no concept of.
+    chain_status      VARCHAR(20) NOT NULL
+                      CHECK (chain_status IN ('pending','confirmed','completed','refunded')),
+
+    -- Our own moments, distinct from the chain's. `verified_at` is when this
+    -- backend read the funded order back and accepted it; it is the only thing
+    -- that may mark a booking paid.
+    verified_at       TIMESTAMP,
+    settled_at        TIMESTAMP,
+    refunded_at       TIMESTAMP,
+    -- The transaction that funded the escrow, for support and reconciliation.
+    deposit_signature TEXT,
+
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Reconciliation sweeps for orders whose on-chain state may have moved on.
+CREATE INDEX IF NOT EXISTS idx_escrow_orders_open
+    ON escrow_orders (chain_status)
+    WHERE chain_status IN ('pending','confirmed');
+CREATE INDEX IF NOT EXISTS idx_escrow_orders_booking ON escrow_orders (booking_id);

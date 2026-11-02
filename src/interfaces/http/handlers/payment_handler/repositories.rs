@@ -4,6 +4,7 @@ use crate::infrastructure::db::DbPool;
 use crate::infrastructure::persistence::postgres::pg_audit_log_repository::PgAuditLogRepository;
 use crate::infrastructure::persistence::postgres::pg_booking_repository::PgBookingRepository;
 use crate::infrastructure::persistence::postgres::pg_catalog_repository::PgCatalogRepository;
+use crate::infrastructure::persistence::postgres::pg_escrow_order_repository::PgEscrowOrderRepository;
 use crate::infrastructure::persistence::postgres::pg_payment_repository::PgPaymentRepository;
 use crate::infrastructure::persistence::postgres::pg_quote_repository::PgQuoteRepository;
 use crate::infrastructure::persistence::postgres::pg_settlement_repository::PgSettlementRepository;
@@ -40,6 +41,10 @@ impl Repositories {
 
     pub(super) fn payments(&self) -> PgPaymentRepository {
         PgPaymentRepository::new(self.pool.clone())
+    }
+
+    pub(super) fn escrow_orders(&self) -> PgEscrowOrderRepository {
+        PgEscrowOrderRepository::new(self.pool.clone())
     }
 
     pub(super) fn catalog(&self) -> PgCatalogRepository {

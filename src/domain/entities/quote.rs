@@ -247,6 +247,82 @@ impl PaymentQuote {
     pub fn is_settleable(&self) -> bool {
         self.status == QuoteStatus::Accepted
     }
+
+    /// How an escrowed payment of this quote divides between the two parties.
+    ///
+    /// The escrow holds one amount and splits it at settlement: the platform's
+    /// fee goes to the treasury and the remainder to the seller. So the split
+    /// has to be decided here, at quoting time, and signed along with the
+    /// amount -- the program takes both numbers from the signed commitment and
+    /// will not let either be supplied by the buyer.
+    ///
+    /// The fiat breakdown already says what the platform earns: `markup` plus
+    /// `service_fee`, with `base` being the operator's own price. That ratio is
+    /// carried across to the token amount rather than recomputed from the
+    /// percentages, so the two can never disagree about a rounded cent.
+    ///
+    /// Integer arithmetic throughout, and the division floors, so the rounding
+    /// remainder goes to the **seller**. Rounding a fee up in the platform's own
+    /// favour is the kind of detail that is invisible per transaction and
+    /// indefensible in aggregate.
+    pub fn escrow_split(&self) -> Result<EscrowSplit, DomainError> {
+        let amount = u64::try_from(self.crypto_base_units).map_err(|_| {
+            // The program's amount is a u64. A quote above that is not a
+            // rounding question, it is a pricing fault.
+            DomainError::ValidationError(
+                "quoted amount is too large to escrow on this chain".to_string(),
+            )
+        })?;
+
+        let total_cents = self.pricing.total.cents();
+        if total_cents <= 0 {
+            return Err(DomainError::ValidationError(
+                "cannot escrow a quote with no total".to_string(),
+            ));
+        }
+        let platform_cents = self
+            .pricing
+            .markup
+            .cents()
+            .checked_add(self.pricing.service_fee.cents())
+            .ok_or_else(|| DomainError::ValidationError("fee overflow".to_string()))?;
+
+        // Widened to u128 before multiplying: `amount` can be billions of
+        // lamports and `platform_cents` millions, which overflows u64 together
+        // long before either is individually unreasonable.
+        let fee_amount = (u128::from(amount) * platform_cents as u128) / total_cents as u128;
+        let fee_amount = u64::try_from(fee_amount)
+            .map_err(|_| DomainError::ValidationError("fee overflow".to_string()))?;
+
+        // The program requires a fee strictly below the amount, because the fee
+        // is carved out of it. `base` is always positive for a real booking, so
+        // this should be unreachable -- but an unreachable state that reaches
+        // the chain fails as an opaque constraint error, so it is checked here
+        // where the message can say what actually went wrong.
+        if fee_amount >= amount {
+            return Err(DomainError::ValidationError(
+                "platform fee would consume the entire escrowed amount".to_string(),
+            ));
+        }
+
+        Ok(EscrowSplit { amount, fee_amount })
+    }
+}
+
+/// The two numbers the escrow program needs, in the token's smallest unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EscrowSplit {
+    /// Total escrowed by the buyer.
+    pub amount: u64,
+    /// Platform fee, paid out of `amount` to the treasury at settlement.
+    pub fee_amount: u64,
+}
+
+impl EscrowSplit {
+    /// What the seller receives at settlement.
+    pub fn seller_amount(self) -> u64 {
+        self.amount - self.fee_amount
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +354,82 @@ mod tests {
             now,
         )
         .unwrap()
+    }
+
+    /// The escrow split decides who gets what out of one on-chain amount. It is
+    /// signed and enforced by the program, so a mistake here is not a reporting
+    /// error -- it is money going to the wrong party.
+    mod escrow_split {
+        use super::*;
+
+        /// `PriceBreakdown` is base + 10% markup + 5% service fee, so a $1,000
+        /// base is a $1,150 total of which $150 is the platform's.
+        fn quote_with(base_cents: i64, base_units: u128) -> PaymentQuote {
+            let mut q = quote_at(Utc::now(), base_cents);
+            q.crypto_base_units = base_units;
+            q
+        }
+
+        #[test]
+        fn carries_the_fiat_fee_ratio_across_to_token_units() {
+            // 150 / 1150 of 1,150,000,000 base units = 150,000,000.
+            let split = quote_with(100_000, 1_150_000_000).escrow_split().unwrap();
+            assert_eq!(split.amount, 1_150_000_000);
+            assert_eq!(split.fee_amount, 150_000_000);
+            assert_eq!(split.seller_amount(), 1_000_000_000);
+        }
+
+        #[test]
+        fn the_two_halves_always_add_back_up_to_the_whole() {
+            // Nothing may be created or lost in the split: the program moves
+            // exactly `amount` into escrow and exactly `amount` back out.
+            for base_units in [1u128, 7, 999, 1_000_000_007, 123_456_789_012] {
+                let split = quote_with(100_000, base_units).escrow_split().unwrap();
+                assert_eq!(
+                    split.fee_amount + split.seller_amount(),
+                    split.amount,
+                    "split of {} did not reconstitute",
+                    base_units
+                );
+            }
+        }
+
+        #[test]
+        fn rounds_the_remainder_to_the_seller_not_the_platform() {
+            // 150/1150 of 7 is 0.913..., which floors to 0. The platform takes
+            // nothing rather than rounding a fee up in its own favour.
+            let split = quote_with(100_000, 7).escrow_split().unwrap();
+            assert_eq!(split.fee_amount, 0);
+            assert_eq!(split.seller_amount(), 7);
+        }
+
+        #[test]
+        fn keeps_the_fee_strictly_below_the_amount_as_the_program_requires() {
+            // The smallest possible escrow: one base unit. A fee of 1 here would
+            // leave the seller with nothing and be rejected on-chain.
+            let split = quote_with(100_000, 1).escrow_split().unwrap();
+            assert!(split.fee_amount < split.amount);
+            assert_eq!(split.seller_amount(), 1);
+        }
+
+        #[test]
+        fn computes_without_overflowing_at_realistic_magnitudes() {
+            // 10^18 base units (a whole ETH-scale amount) times millions of
+            // cents overflows u64 during the multiply, which is why the
+            // intermediate is widened.
+            let split = quote_with(100_000_000, 1_000_000_000_000_000_000)
+                .escrow_split()
+                .unwrap();
+            assert_eq!(split.amount, 1_000_000_000_000_000_000);
+            assert!(split.fee_amount < split.amount);
+            assert_eq!(split.fee_amount + split.seller_amount(), split.amount);
+        }
+
+        #[test]
+        fn refuses_an_amount_that_does_not_fit_the_programs_u64() {
+            let err = quote_with(100_000, u128::from(u64::MAX) + 1).escrow_split();
+            assert!(matches!(err, Err(DomainError::ValidationError(_))));
+        }
     }
 
     #[test]

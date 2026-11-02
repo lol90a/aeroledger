@@ -15,6 +15,7 @@ use actix_web::web;
 
 mod access;
 mod audit;
+mod escrow;
 mod options;
 mod proof;
 mod quote;
@@ -23,6 +24,7 @@ mod settlement;
 
 // These were reachable as `payment_handler::CreateQuoteRequest` before the split.
 // Re-exporting keeps that path working, so the move is invisible from outside.
+pub use escrow::{AuthorizeEscrowRequest, VerifyEscrowRequest};
 pub use quote::{AcceptQuoteRequest, CreateQuoteRequest};
 pub use settlement::{ConfirmPaymentRequest, InitPaymentRequest};
 
@@ -34,6 +36,14 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .route("/options", web::get().to(options::payment_options))
             .route("/quote", web::post().to(quote::create_quote))
             .route("/quote/accept", web::post().to(quote::accept_quote))
+            // Escrow: the backend authorises a price and later verifies what
+            // the buyer's wallet actually put on-chain. It never submits a
+            // transaction itself.
+            .route(
+                "/escrow/authorize",
+                web::post().to(escrow::authorize_escrow),
+            )
+            .route("/escrow/verify", web::post().to(escrow::verify_escrow))
             .route("/init", web::post().to(settlement::init_payment))
             .route("/confirm", web::post().to(settlement::confirm_payment))
             .route(

@@ -15,8 +15,9 @@
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
+use crate::domain::ports::quote_signer::{EscrowQuote, QuoteSigner, SignedEscrowQuote};
 use crate::infrastructure::blockchain::solana_escrow_gateway::keccak256;
-use crate::shared::errors::InfraError;
+use crate::shared::errors::{DomainError, InfraError};
 
 /// Domain separator. Must equal `QUOTE_DOMAIN` in the program.
 const QUOTE_DOMAIN: &[u8] = b"AEROLEDGER_ORDER_QUOTE_V1";
@@ -221,6 +222,60 @@ impl QuoteAuthority {
             authority: self.authority_base58(),
             commitment,
         }
+    }
+}
+
+/// Decode a base58 Solana address into the raw 32 bytes the signed message
+/// carries.
+///
+/// The message commits to raw keys, never to their base58 text: two different
+/// strings can encode the same key (leading-zero handling, whitespace), and a
+/// signature must not depend on which spelling the caller used.
+fn address_bytes(label: &str, address: &str) -> Result<[u8; 32], DomainError> {
+    let bytes = bs58::decode(address.trim())
+        .into_vec()
+        .map_err(|_| DomainError::ValidationError(format!("{} is not base58", label)))?;
+    bytes.try_into().map_err(|_| {
+        DomainError::ValidationError(format!("{} is not a 32-byte Solana address", label))
+    })
+}
+
+#[async_trait::async_trait]
+impl QuoteSigner for QuoteAuthority {
+    fn sign_escrow_quote(
+        &self,
+        order_id: &str,
+        buyer: &str,
+        seller: &str,
+        mint: &str,
+        quote: EscrowQuote,
+    ) -> Result<SignedEscrowQuote, DomainError> {
+        let signed = self.sign_quote(
+            order_id,
+            &address_bytes("buyer wallet", buyer)?,
+            &address_bytes("seller", seller)?,
+            &address_bytes("mint", mint)?,
+            QuoteCommitment {
+                amount: quote.amount,
+                fee_amount: quote.fee_amount,
+                expiry: quote.expiry,
+            },
+        );
+
+        Ok(SignedEscrowQuote {
+            message: signed.message,
+            signature: signed.signature,
+            authority: signed.authority,
+            quote,
+        })
+    }
+
+    fn authority_base58(&self) -> String {
+        QuoteAuthority::authority_base58(self)
+    }
+
+    fn authorization_expiry(&self, now: i64, reservation_expires_at: i64) -> Option<i64> {
+        QuoteAuthority::authorization_expiry(now, reservation_expires_at)
     }
 }
 

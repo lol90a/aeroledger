@@ -1,8 +1,10 @@
 pub mod accept_quote;
 pub mod authenticate_user;
+pub mod authorize_escrow;
 pub mod confirm_payment;
 pub mod create_booking;
 pub mod create_quote;
 pub mod create_user;
 pub mod get_transactions;
 pub mod init_payment;
+pub mod verify_escrow_deposit;
