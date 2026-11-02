@@ -38,4 +38,9 @@ base64 = "0.22"
 sha3 = "0.10"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# EIP-712 quote signatures for the Solidity escrow. secp256k1 with recoverable
+# ECDSA, so the contract can recover the signer from (r, s, v) rather than being
+# told who signed. Pure Rust, no libsecp256k1 build step.
+k256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"

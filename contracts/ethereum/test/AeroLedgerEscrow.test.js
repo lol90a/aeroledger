@@ -1084,4 +1084,89 @@ describe("AeroLedgerEscrow", () => {
       ).to.be.revertedWithCustomError(escrow, "OwnableUnauthorizedAccount");
     });
   });
+
+  /**
+   * The Rust backend reproduces this contract's order hash, domain separator
+   * and quote digest so it can sign prices the contract will accept. All three
+   * are built on Solidity ABI encoding, whose rules are easy to get almost
+   * right, and a mistake cannot let anything through -- it just makes every
+   * payment fail as InvalidQuoteSignature, an error that points at the key
+   * rather than at the message.
+   *
+   * The committed vector is what the backend checks itself against. This keeps
+   * it honest: if the contract's domain, typehash or hashing changes and nobody
+   * regenerates, the vector is stale and the backend would be signing for a
+   * contract that no longer exists in that form.
+   */
+  describe("EIP-712 golden vector", () => {
+    const golden = require("./eip712_golden.json");
+
+    it("is still what this contract computes", async () => {
+      // Deployed fresh here, so the vector's own verifyingContract is used
+      // rather than this suite's -- the addresses differ by deployer nonce.
+      const Escrow = await ethers.getContractFactory("AeroLedgerEscrow");
+      const fresh = await Escrow.deploy(
+        owner.address,
+        golden.input.quoteSigner,
+        treasury.address,
+        REFUND_WINDOW
+      );
+
+      expect(
+        await fresh.computeOrderHash(golden.input.buyer, golden.input.orderId)
+      ).to.equal(golden.expected.orderHash);
+
+      // The digest depends on the deployed address, so compare against this
+      // deployment's rather than the recorded one.
+      const digest = await fresh.quoteDigest(
+        golden.expected.orderHash,
+        golden.input.buyer,
+        golden.input.seller,
+        golden.input.token,
+        golden.input.amount,
+        golden.input.fee,
+        golden.input.expiry
+      );
+      const expectedDigest = ethers.TypedDataEncoder.hash(
+        {
+          name: "AeroLedgerEscrow",
+          version: "2",
+          chainId: Number(golden.input.chainId),
+          verifyingContract: await fresh.getAddress(),
+        },
+        {
+          Quote: [
+            { name: "orderHash", type: "bytes32" },
+            { name: "buyer", type: "address" },
+            { name: "seller", type: "address" },
+            { name: "token", type: "address" },
+            { name: "amount", type: "uint256" },
+            { name: "fee", type: "uint256" },
+            { name: "expiry", type: "uint256" },
+          ],
+        },
+        {
+          orderHash: golden.expected.orderHash,
+          buyer: golden.input.buyer,
+          seller: golden.input.seller,
+          token: golden.input.token,
+          amount: golden.input.amount,
+          fee: golden.input.fee,
+          expiry: golden.input.expiry,
+        }
+      );
+      expect(digest).to.equal(expectedDigest);
+    });
+
+    it("carries a signature this contract would accept", async () => {
+      // Recovering the signer is exactly what _verifyQuote does. If this
+      // recovers anything else, the bytes the backend asserts against are bytes
+      // the contract would reject.
+      const recovered = ethers.recoverAddress(
+        golden.expected.quoteDigest,
+        golden.expected.signature
+      );
+      expect(recovered).to.equal(golden.input.quoteSigner);
+    });
+  });
 });
