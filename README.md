@@ -255,6 +255,25 @@ docker compose up -d postgres
 Dev Postgres, published on host port **5435** so it does not collide with another
 instance. The schema is applied by the backend at startup.
 
+If the backend then refuses to start, it will tell you what is wrong:
+
+```
+Could not reach Postgres at localhost:5435: nothing is listening.
+Start it with:  docker compose up -d postgres
+If another project's Postgres is already running it will be on a different
+port; check that `docker ps` and DATABASE_URL agree.
+```
+
+That last line is the one worth reading twice. On a machine with more than one
+project checked out, `docker ps` happily shows *a* healthy Postgres and the
+obvious conclusion — "the database is up, so it must be something else" — is
+wrong. Check the container name and the published port, not just that one
+exists:
+
+```bash
+docker ps --filter name=postgres --format "{{.Names}} | {{.Ports}}"
+```
+
 ### 2. Backend
 
 ```bash
@@ -412,5 +431,13 @@ Stated plainly, because a reader would otherwise reasonably assume otherwise:
   settlement-status mapping, cart identity, JWT handling, and the whole escrow
   wire format on both chains — the quote message, account ordering, Borsh and
   ABI encoding, wrapped-SOL planning, account decoding. There are no component
-  or end-to-end tests; rendering is covered by type-checking and a production
-  build.
+  or end-to-end tests.
+
+  **Type-checking and a successful build do not prove the page renders.** The
+  Solana libraries read the Node `Buffer` global at import time; a browser has
+  none, Vite externalises the module rather than polyfilling it, and the result
+  was a blank page on every route. `tsc` was happy — the types are real — and
+  `vite build` was happy — the bundle is valid. The unit tests were happy too,
+  because jsdom runs in Node, where `Buffer` exists. Nothing short of loading
+  the page catches it. `src/polyfills.ts` fixes it and has to stay the first
+  import in `main.tsx`.
